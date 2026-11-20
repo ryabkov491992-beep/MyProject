@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import {
   Plus,
   Trash2,
@@ -44,9 +44,23 @@ import {
   Mail,
   CalendarPlus,
   Database,
+  Pencil,
+  Square,
+  Type,
+  Undo2,
+  Flame,
+  Cloud,
+  CloudOff,
+  Loader2,
+  LogOut,
 } from 'lucide-react';
 
-// === 1. INDEXEDDB ХРАНИЛИЩЕ (С АВТОМИГРАЦИЕЙ ИЗ LOCALSTORAGE) ===
+// === КОНФИГУРАЦИЯ GOOGLE DRIVE ===
+const GOOGLE_CLIENT_ID = '779901409260-rhq1b311eqtaoonell1scqovsfsj4isa.apps.googleusercontent.com';
+const GOOGLE_DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const CLOUD_DB_FILENAME = 'SUP_Tracker_Cloud_DB.json';
+
+// === 1. INDEXEDDB ХРАНИЛИЩЕ ===
 
 const IDB_NAME = 'SUP_Tracker_DB';
 const IDB_STORE = 'kv_store';
@@ -109,7 +123,6 @@ function useIndexedStorage<T>(key: string, initialValue: T): [T, React.Dispatch<
         setIsLoaded(true);
         return;
       }
-      // Миграция из старого localStorage при первом запуске
       try {
         const legacyRaw = localStorage.getItem(key);
         if (legacyRaw !== null) {
@@ -136,6 +149,13 @@ function useIndexedStorage<T>(key: string, initialValue: T): [T, React.Dispatch<
 }
 
 // === 2. УТИЛИТЫ ДАТ, НЕДЕЛЬ, СЖАТИЯ ИЗОБРАЖЕНИЙ И .ICS ===
+
+const normalizeScreenshots = (val: any): string[] => {
+  if (!val) return [];
+  if (Array.isArray(val)) return val.filter(Boolean);
+  if (typeof val === 'string' && val.trim()) return [val];
+  return [];
+};
 
 const getTodayDMY = () => {
   const d = new Date();
@@ -229,8 +249,7 @@ const isDateInWeek = (dateStr: string, isoWeek: string): boolean => {
   return d >= range.start && d <= range.end;
 };
 
-// Автосжатие изображений до 1400px (JPEG 82%)
-const compressImageDataUrl = (dataUrl: string, maxWidth = 1400, quality = 0.82): Promise<string> => {
+const compressImageDataUrl = (dataUrl: string, maxWidth = 1400, quality = 0.85): Promise<string> => {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
@@ -257,7 +276,6 @@ const compressImageDataUrl = (dataUrl: string, maxWidth = 1400, quality = 0.82):
   });
 };
 
-// Экспорт события в .ics (Google Calendar / Outlook / Apple Calendar)
 const downloadICSFile = (title: string, dateDMY: string, timeHHMM?: string, description?: string) => {
   const iso = formatToISO(dateDMY);
   if (!iso) return;
@@ -299,7 +317,6 @@ const downloadICSFile = (title: string, dateDMY: string, timeHHMM?: string, desc
   link.click();
 };
 
-// Звуковой сигнал уведомления через Web Audio API (без внешних mp3)
 const playNotificationChime = () => {
   try {
     const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -378,7 +395,419 @@ const matchDateFilter = (itemDate: string, filterVal: string) => {
   return displayDate.includes(normalizedFilter);
 };
 
-// === 3. БАЗОВЫЕ UI-КОМПОНЕНТЫ ===
+// === 3. РЕДАКТОР ПОМЕТОК НА СКРИНШОТАХ (ЛАЙТБОКС) ===
+
+type DrawShape =
+  | { type: 'rect'; color: string; x1: number; y1: number; x2: number; y2: number }
+  | { type: 'arrow'; color: string; x1: number; y1: number; x2: number; y2: number }
+  | { type: 'pen'; color: string; points: Array<{ x: number; y: number }> }
+  | { type: 'text'; color: string; x: number; y: number; text: string };
+
+function ScreenshotLightboxModal({
+  images,
+  initialIndex,
+  onClose,
+  onSaveEditedImage,
+}: {
+  images: string[];
+  initialIndex: number;
+  onClose: () => void;
+  onSaveEditedImage?: (index: number, newDataUrl: string) => void;
+}) {
+  const [currentIndex, setCurrentIndex] = useState(initialIndex);
+  const [isAnnotating, setIsAnnotating] = useState(false);
+  const [tool, setTool] = useState<'rect' | 'arrow' | 'pen' | 'text'>('rect');
+  const [color, setColor] = useState('#ef4444');
+  const [shapes, setShapes] = useState<DrawShape[]>([]);
+  const [draftShape, setDraftShape] = useState<DrawShape | null>(null);
+  const [textDraft, setTextDraft] = useState<{ x: number; y: number; value: string } | null>(null);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const loadedImgRef = useRef<HTMLImageElement | null>(null);
+
+  const currentSrc = images[currentIndex];
+
+  useEffect(() => {
+    setShapes([]);
+    setDraftShape(null);
+    setTextDraft(null);
+    setIsAnnotating(false);
+  }, [currentIndex]);
+
+  useEffect(() => {
+    if (!isAnnotating || !currentSrc) return;
+    const img = new Image();
+    img.onload = () => {
+      loadedImgRef.current = img;
+      redrawCanvas(img, shapes, draftShape);
+    };
+    img.src = currentSrc;
+  }, [isAnnotating, currentSrc]);
+
+  useEffect(() => {
+    if (isAnnotating && loadedImgRef.current) {
+      redrawCanvas(loadedImgRef.current, shapes, draftShape);
+    }
+  }, [shapes, draftShape, isAnnotating]);
+
+  const drawSingleShape = (ctx: CanvasRenderingContext2D, s: DrawShape, scaleFactor: number) => {
+    const lw = Math.max(3, Math.round(4 * scaleFactor));
+    ctx.strokeStyle = s.color;
+    ctx.fillStyle = s.color;
+    ctx.lineWidth = lw;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    if (s.type === 'rect') {
+      ctx.strokeRect(s.x1, s.y1, s.x2 - s.x1, s.y2 - s.y1);
+    } else if (s.type === 'arrow') {
+      const headLen = Math.max(14, 18 * scaleFactor);
+      const angle = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
+      ctx.beginPath();
+      ctx.moveTo(s.x1, s.y1);
+      ctx.lineTo(s.x2, s.y2);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(s.x2, s.y2);
+      ctx.lineTo(
+        s.x2 - headLen * Math.cos(angle - Math.PI / 6),
+        s.y2 - headLen * Math.sin(angle - Math.PI / 6)
+      );
+      ctx.lineTo(
+        s.x2 - headLen * Math.cos(angle + Math.PI / 6),
+        s.y2 - headLen * Math.sin(angle + Math.PI / 6)
+      );
+      ctx.closePath();
+      ctx.fill();
+    } else if (s.type === 'pen' && s.points.length > 0) {
+      ctx.beginPath();
+      ctx.moveTo(s.points[0].x, s.points[0].y);
+      s.points.forEach((pt) => ctx.lineTo(pt.x, pt.y));
+      ctx.stroke();
+    } else if (s.type === 'text' && s.text.trim()) {
+      const fontSize = Math.max(18, Math.round(24 * scaleFactor));
+      ctx.font = `bold ${fontSize}px Arial, sans-serif`;
+      const metrics = ctx.measureText(s.text);
+      const pad = Math.round(6 * scaleFactor);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
+      ctx.fillRect(s.x - pad, s.y - fontSize, metrics.width + pad * 2, fontSize + pad * 1.5);
+      ctx.fillStyle = s.color;
+      ctx.fillText(s.text, s.x, s.y);
+    }
+  };
+
+  const redrawCanvas = (img: HTMLImageElement, allShapes: DrawShape[], activeDraft: DrawShape | null) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    const scaleFactor = Math.max(1, canvas.width / 900);
+    allShapes.forEach((s) => drawSingleShape(ctx, s, scaleFactor));
+    if (activeDraft) {
+      drawSingleShape(ctx, activeDraft, scaleFactor);
+    }
+  };
+
+  const getCanvasCoords = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (e.clientX - rect.left) * scaleX,
+      y: (e.clientY - rect.top) * scaleY,
+    };
+  };
+
+  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isAnnotating) return;
+    const { x, y } = getCanvasCoords(e);
+
+    if (tool === 'text') {
+      if (textDraft && textDraft.value.trim()) {
+        setShapes((prev) => [...prev, { type: 'text', color, x: textDraft.x, y: textDraft.y, text: textDraft.value.trim() }]);
+      }
+      setTextDraft({ x, y, value: '' });
+      return;
+    }
+
+    if (tool === 'rect') {
+      setDraftShape({ type: 'rect', color, x1: x, y1: y, x2: x, y2: y });
+    } else if (tool === 'arrow') {
+      setDraftShape({ type: 'arrow', color, x1: x, y1: y, x2: x, y2: y });
+    } else if (tool === 'pen') {
+      setDraftShape({ type: 'pen', color, points: [{ x, y }] });
+    }
+  };
+
+  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!draftShape) return;
+    const { x, y } = getCanvasCoords(e);
+    if (draftShape.type === 'rect' || draftShape.type === 'arrow') {
+      setDraftShape({ ...draftShape, x2: x, y2: y });
+    } else if (draftShape.type === 'pen') {
+      setDraftShape({ ...draftShape, points: [...draftShape.points, { x, y }] });
+    }
+  };
+
+  const handleMouseUp = () => {
+    if (!draftShape) return;
+    setShapes((prev) => [...prev, draftShape]);
+    setDraftShape(null);
+  };
+
+  const commitTextDraft = () => {
+    if (textDraft && textDraft.value.trim()) {
+      setShapes((prev) => [...prev, { type: 'text', color, x: textDraft.x, y: textDraft.y, text: textDraft.value.trim() }]);
+    }
+    setTextDraft(null);
+  };
+
+  const handleSaveAnnotated = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || !onSaveEditedImage) return;
+    const updatedDataUrl = canvas.toDataURL('image/jpeg', 0.88);
+    onSaveEditedImage(currentIndex, updatedDataUrl);
+    setIsAnnotating(false);
+    setShapes([]);
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (textDraft) {
+          setTextDraft(null);
+        } else if (isAnnotating) {
+          setIsAnnotating(false);
+        } else {
+          onClose();
+        }
+      } else if (!isAnnotating && images.length > 1) {
+        if (e.key === 'ArrowRight') {
+          setCurrentIndex((prev) => (prev + 1) % images.length);
+        } else if (e.key === 'ArrowLeft') {
+          setCurrentIndex((prev) => (prev - 1 + images.length) % images.length);
+        }
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [isAnnotating, textDraft, images.length, onClose]);
+
+  return (
+    <div
+      onClick={() => {
+        if (!isAnnotating) onClose();
+      }}
+      className="fixed inset-0 bg-slate-900/90 backdrop-blur-xs z-50 flex flex-col items-center justify-center p-4"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="relative max-w-6xl w-full flex flex-col items-center gap-3"
+      >
+        <div className="bg-slate-800/95 border border-slate-700 text-white px-3 py-2 rounded-xl flex flex-wrap items-center justify-center gap-2 shadow-xl">
+          {!isAnnotating ? (
+            <>
+              {onSaveEditedImage && (
+                <button
+                  type="button"
+                  onClick={() => setIsAnnotating(true)}
+                  className="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                >
+                  <Pencil size={14} /> Пометить на скриншоте (рамка / стрелка / текст)
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onClose}
+                className="bg-slate-700 hover:bg-slate-600 text-slate-200 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1"
+              >
+                <X size={14} /> Закрыть (ESC)
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-1 bg-slate-900/80 p-1 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitTextDraft();
+                    setTool('rect');
+                  }}
+                  className={`px-2.5 py-1 rounded text-xs font-medium flex items-center gap-1 ${
+                    tool === 'rect' ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:text-white'
+                  }`}
+                >
+                  <Square size={13} /> Рамка
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitTextDraft();
+                    setTool('arrow');
+                  }}
+                  className={`px-2.5 py-1 rounded text-xs font-medium flex items-center gap-1 ${
+                    tool === 'arrow' ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:text-white'
+                  }`}
+                >
+                  <ArrowUpRight size={14} /> Стрелка
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitTextDraft();
+                    setTool('pen');
+                  }}
+                  className={`px-2.5 py-1 rounded text-xs font-medium flex items-center gap-1 ${
+                    tool === 'pen' ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:text-white'
+                  }`}
+                >
+                  <Pencil size={13} /> Маркер
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTool('text')}
+                  className={`px-2.5 py-1 rounded text-xs font-medium flex items-center gap-1 ${
+                    tool === 'text' ? 'bg-indigo-600 text-white' : 'text-slate-300 hover:text-white'
+                  }`}
+                >
+                  <Type size={13} /> Текст
+                </button>
+              </div>
+
+              <div className="flex items-center gap-1.5 px-2 border-x border-slate-700">
+                {[
+                  { hex: '#ef4444', label: 'Красный' },
+                  { hex: '#2563eb', label: 'Синий' },
+                  { hex: '#eab308', label: 'Желтый' },
+                  { hex: '#10b981', label: 'Зеленый' },
+                ].map((c) => (
+                  <button
+                    key={c.hex}
+                    type="button"
+                    onClick={() => setColor(c.hex)}
+                    style={{ backgroundColor: c.hex }}
+                    className={`w-5 h-5 rounded-full border-2 transition-transform ${
+                      color === c.hex ? 'border-white scale-115' : 'border-transparent opacity-75 hover:opacity-100'
+                    }`}
+                    title={c.label}
+                  />
+                ))}
+              </div>
+
+              <button
+                type="button"
+                disabled={shapes.length === 0}
+                onClick={() => setShapes((prev) => prev.slice(0, -1))}
+                className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-700 hover:bg-slate-600 disabled:opacity-40 flex items-center gap-1"
+                title="Отменить последний элемент"
+              >
+                <Undo2 size={13} /> Назад
+              </button>
+
+              <button
+                type="button"
+                onClick={handleSaveAnnotated}
+                className="bg-emerald-600 hover:bg-emerald-500 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 shadow"
+              >
+                <Check size={14} /> Сохранить пометки
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setIsAnnotating(false);
+                  setShapes([]);
+                  setTextDraft(null);
+                }}
+                className="text-xs text-slate-300 hover:text-white px-2 py-1"
+              >
+                Отмена
+              </button>
+            </>
+          )}
+        </div>
+
+        {isAnnotating && textDraft && (
+          <div className="bg-slate-800 border border-indigo-400 px-3 py-2 rounded-xl flex items-center gap-2 shadow-lg">
+            <span className="text-xs text-slate-300">Подпись на скриншоте:</span>
+            <input
+              type="text"
+              autoFocus
+              value={textDraft.value}
+              onChange={(e) => setTextDraft({ ...textDraft, value: e.target.value })}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  commitTextDraft();
+                }
+              }}
+              placeholder="Введите текст (RU / עברית)..."
+              className="px-2.5 py-1 text-xs bg-white text-slate-900 rounded focus:outline-none min-w-[220px]"
+            />
+            <button
+              type="button"
+              onClick={commitTextDraft}
+              className="bg-indigo-600 text-white px-2.5 py-1 rounded text-xs font-medium"
+            >
+              OK
+            </button>
+          </div>
+        )}
+
+        {!isAnnotating ? (
+          <img
+            src={currentSrc}
+            alt={`Скриншот ${currentIndex + 1}`}
+            className="max-w-full max-h-[78vh] rounded-xl shadow-2xl border border-white/15 bg-white"
+          />
+        ) : (
+          <div className="relative max-w-full max-h-[78vh] flex items-center justify-center">
+            <canvas
+              ref={canvasRef}
+              onMouseDown={handleMouseDown}
+              onMouseMove={handleMouseMove}
+              onMouseUp={handleMouseUp}
+              className="max-w-full max-h-[78vh] rounded-xl shadow-2xl border-2 border-indigo-400 bg-white cursor-crosshair"
+            />
+          </div>
+        )}
+
+        {!isAnnotating && images.length > 1 && (
+          <div className="flex items-center gap-3 bg-slate-800/90 text-white px-4 py-1.5 rounded-full border border-slate-700 text-xs">
+            <button
+              type="button"
+              onClick={() => setCurrentIndex((prev) => (prev - 1 + images.length) % images.length)}
+              className="hover:text-indigo-300 flex items-center gap-1 font-medium"
+            >
+              <ChevronLeft size={15} /> Предыдущий
+            </button>
+            <span className="font-mono text-slate-300">
+              {currentIndex + 1} / {images.length}
+            </span>
+            <button
+              type="button"
+              onClick={() => setCurrentIndex((prev) => (prev + 1) % images.length)}
+              className="hover:text-indigo-300 flex items-center gap-1 font-medium"
+            >
+              Следующий <ChevronRight size={15} />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// === 4. БАЗОВЫЕ UI-КОМПОНЕНТЫ ===
 
 function DateInput({
   value,
@@ -643,23 +1072,32 @@ const handlePasteImage = (e: any, callback: (img: string) => void) => {
   };
 
   if (clipboardData.items) {
+    let foundImage = false;
     for (const item of clipboardData.items) {
       if (item.type && item.type.indexOf('image') === 0) {
-        e.preventDefault();
-        e.stopPropagation();
+        if (!foundImage) {
+          e.preventDefault();
+          e.stopPropagation();
+          foundImage = true;
+        }
         const file = item.getAsFile();
         if (file) processFile(file);
-        return;
       }
     }
+    if (foundImage) return;
   }
 
   if (clipboardData.files && clipboardData.files.length > 0) {
-    const file = clipboardData.files[0];
-    if (file.type && file.type.indexOf('image') === 0) {
-      e.preventDefault();
-      e.stopPropagation();
-      processFile(file);
+    let foundImage = false;
+    for (const file of Array.from(clipboardData.files) as File[]) {
+      if (file.type && file.type.indexOf('image') === 0) {
+        if (!foundImage) {
+          e.preventDefault();
+          e.stopPropagation();
+          foundImage = true;
+        }
+        processFile(file);
+      }
     }
   }
 };
@@ -669,73 +1107,102 @@ function ImageCell({
   onChange,
   onPreview,
 }: {
-  src: string;
-  onChange: (val: string) => void;
-  onPreview: (val: string) => void;
+  src: string | string[];
+  onChange: (val: string[]) => void;
+  onPreview: (images: string[], startIndex: number, onSaveEdited: (idx: number, newUrl: string) => void) => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const images = normalizeScreenshots(src);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async (ev: any) => {
-      const compressed = await compressImageDataUrl(ev.target.result);
-      onChange(compressed);
-    };
-    reader.readAsDataURL(file);
+  const handleAddImage = (newImg: string) => {
+    onChange([...images, newImg]);
+  };
+
+  const handleRemoveImage = (indexToRemove: number) => {
+    onChange(images.filter((_, idx) => idx !== indexToRemove));
+  };
+
+  const handleSaveEditedAt = (idx: number, newUrl: string) => {
+    const next = [...images];
+    next[idx] = newUrl;
+    onChange(next);
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const compressedList: string[] = [];
+    for (const file of files) {
+      const dataUrl = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (ev: any) => resolve(ev.target.result);
+        reader.readAsDataURL(file);
+      });
+      const compressed = await compressImageDataUrl(dataUrl);
+      compressedList.push(compressed);
+    }
+    onChange([...images, ...compressedList]);
     e.target.value = '';
   };
 
-  if (src) {
-    return (
-      <div className="relative inline-block group/img">
-        <img
-          src={src}
-          alt="Скриншот"
-          onClick={() => onPreview(src)}
-          className="h-11 w-18 object-cover rounded border border-slate-200 cursor-zoom-in shadow-xs"
+  return (
+    <div className="flex flex-col items-center gap-1.5">
+      {images.length > 0 && (
+        <div className="flex flex-wrap items-center justify-center gap-1.5 max-w-[170px]">
+          {images.map((imgSrc, idx) => (
+            <div key={idx} className="relative inline-block group/img">
+              <img
+                src={imgSrc}
+                alt={`Скриншот ${idx + 1}`}
+                onClick={() => onPreview(images, idx, handleSaveEditedAt)}
+                className="h-11 w-14 object-cover rounded border border-slate-200 cursor-zoom-in shadow-xs hover:border-indigo-400 transition-colors"
+                title="Нажмите для просмотра и нанесения пометок"
+              />
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleRemoveImage(idx);
+                }}
+                className="absolute -top-1.5 -right-1.5 bg-rose-500 text-white rounded-full p-0.5 opacity-0 group-hover/img:opacity-100 transition-opacity shadow"
+                title="Удалить скриншот"
+              >
+                <X size={10} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="flex items-center justify-center gap-1">
+        <div
+          ref={boxRef}
+          tabIndex={0}
+          onClick={() => boxRef.current?.focus()}
+          onPaste={(e) => handlePasteImage(e, handleAddImage)}
+          className="text-[10px] text-slate-400 py-1 px-2 border border-dashed border-slate-300 rounded-lg hover:border-indigo-400 hover:text-indigo-600 focus:border-indigo-600 focus:bg-indigo-50/70 focus:text-indigo-700 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none cursor-pointer transition-all select-none"
+          title="Кликните сюда и нажмите Ctrl+V, чтобы добавить скриншот"
+        >
+          {images.length > 0 ? '+ Ctrl+V' : 'Ctrl+V'}
+        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={handleFileChange}
+          className="hidden"
         />
         <button
           type="button"
-          onClick={() => onChange('')}
-          className="absolute -top-1.5 -right-1.5 bg-rose-500 text-white rounded-full p-0.5 opacity-0 group-hover/img:opacity-100 transition-opacity shadow"
-          title="Удалить скриншот"
+          onClick={() => fileRef.current?.click()}
+          className="p-1 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg border border-transparent hover:border-indigo-200 transition-colors"
+          title="Выбрать файлы с компьютера"
         >
-          <X size={10} />
+          <ImageIcon size={13} />
         </button>
       </div>
-    );
-  }
-
-  return (
-    <div className="flex items-center justify-center gap-1">
-      <div
-        ref={boxRef}
-        tabIndex={0}
-        onClick={() => boxRef.current?.focus()}
-        onPaste={(e) => handlePasteImage(e, onChange)}
-        className="text-[10px] text-slate-400 py-1.5 px-2 border border-dashed border-slate-300 rounded-lg hover:border-indigo-400 hover:text-indigo-600 focus:border-indigo-600 focus:bg-indigo-50/70 focus:text-indigo-700 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none cursor-pointer transition-all select-none"
-        title="Кликните сюда и нажмите Ctrl+V, чтобы вставить скриншот (автоматически сжимается)"
-      >
-        Ctrl+V
-      </div>
-      <input
-        ref={fileRef}
-        type="file"
-        accept="image/*"
-        onChange={handleFileChange}
-        className="hidden"
-      />
-      <button
-        type="button"
-        onClick={() => fileRef.current?.click()}
-        className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg border border-transparent hover:border-indigo-200 transition-colors"
-        title="Загрузить файл изображения с компьютера"
-      >
-        <ImageIcon size={13} />
-      </button>
     </div>
   );
 }
@@ -759,7 +1226,7 @@ const exportToCSV = (data: any[], filename: string) => {
   link.click();
 };
 
-// === 4. СТРУКТУРА РАЗДЕЛОВ И ЗАДАЧ (17 РАЗДЕЛОВ) ===
+// === 5. СТРУКТУРА РАЗДЕЛОВ И ЗАДАЧ (17 РАЗДЕЛОВ) ===
 
 const DEFAULT_TASK_STATUSES = [
   'выполнено',
@@ -1045,7 +1512,7 @@ const calcProjectRemainingHours = (proj: any) => {
   return Number(sum.toFixed(1));
 };
 
-// === 5. ГЛОБАЛЬНЫЙ ПОИСК (CTRL + K) ===
+// === 6. ГЛОБАЛЬНЫЙ ПОИСК (CTRL + K) ===
 
 function GlobalSearchModal({
   projects,
@@ -1268,10 +1735,11 @@ function GlobalSearchModal({
   );
 }
 
-// === 6. ВКЛАДКА 0: СВОДКА, ДАЙДЖЕСТ И КАЛЕНДАРЬ ПЛАНИРОВАНИЯ ===
+// === 7. ВКЛАДКА 0: СВОДКА, ФОКУС ДНЯ И КАЛЕНДАРЬ ПЛАНИРОВАНИЯ ===
 
 function TabOverviewCalendar({
   projects,
+  setProjects,
   meetings,
   tasks,
   calendarEvents,
@@ -1287,6 +1755,7 @@ function TabOverviewCalendar({
   const [newEventTitle, setNewEventTitle] = useState('');
   const [newEventProject, setNewEventProject] = useState('');
   const [newEventTime, setNewEventTime] = useState('');
+  const [focusProjectFilter, setFocusProjectFilter] = useState('');
 
   const [showSources, setShowSources] = useState({
     deadlines: true,
@@ -1294,6 +1763,72 @@ function TabOverviewCalendar({
     meetings: true,
     custom: true,
   });
+
+  const focusItems = useMemo(() => {
+    const list: Array<{
+      projectId: string;
+      projectNum: string;
+      projectName: string;
+      taskIndex: number;
+      code: string;
+      name: string;
+      status: string;
+      priority: string;
+      estHours: number;
+      comment: string;
+    }> = [];
+
+    projects.forEach((p: any) => {
+      if (focusProjectFilter && p.id !== focusProjectFilter) return;
+      (p.tasks || []).forEach((t: any, idx: number) => {
+        if (t.isHeader) return;
+        const st = (t.status || '').toLowerCase();
+        if (st === 'в работе' || st === 'требует исправления') {
+          list.push({
+            projectId: p.id,
+            projectNum: p.num,
+            projectName: p.name || '',
+            taskIndex: idx,
+            code: t.code || '',
+            name: t.name,
+            status: t.status,
+            priority: String(t.priority || '').trim(),
+            estHours: parseFloat(String(t.estHours || '').replace(',', '.')) || 0,
+            comment: t.comment || '',
+          });
+        }
+      });
+    });
+
+    return list.sort((a, b) => {
+      if (!a.priority && !b.priority) return 0;
+      if (!a.priority) return 1;
+      if (!b.priority) return -1;
+      return a.priority.localeCompare(b.priority, 'ru', { numeric: true });
+    });
+  }, [projects, focusProjectFilter]);
+
+  const totalFocusHours = useMemo(
+    () => Number(focusItems.reduce((acc, item) => acc + item.estHours, 0).toFixed(1)),
+    [focusItems]
+  );
+
+  const handleQuickUpdateFocusStatus = (projectId: string, taskIndex: number, newStatus: string) => {
+    setProjects(
+      projects.map((p: any) => {
+        if (p.id !== projectId) return p;
+        const updatedTasks = [...(p.tasks || [])];
+        if (updatedTasks[taskIndex]) {
+          updatedTasks[taskIndex] = {
+            ...updatedTasks[taskIndex],
+            status: newStatus,
+            date: newStatus && !updatedTasks[taskIndex].date ? getTodayDMY() : updatedTasks[taskIndex].date,
+          };
+        }
+        return { ...p, tasks: updatedTasks };
+      })
+    );
+  };
 
   const eventsByDate: Record<
     string,
@@ -1428,13 +1963,11 @@ function TabOverviewCalendar({
   const todayEvents = eventsByDate[todayDMY] || [];
   const selectedDayEvents = eventsByDate[selectedDayDMY] || [];
 
-  // Просроченные и горящие дедлайны
   const urgentProjects = projects.filter((p: any) => {
     const u = getDeadlineUrgency(p.deadline);
     return u === 'overdue' || u === 'soon';
   });
 
-  // Зависшие замечания (> 5 дней без ответа)
   const staleRemarksCount = projects.reduce((acc: number, p: any) => {
     const stale = (p.remarks || []).filter((r: any) => {
       const st = (r.status || '').toLowerCase();
@@ -1477,7 +2010,6 @@ function TabOverviewCalendar({
 
   return (
     <div className="space-y-6">
-      {/* УТРЕННИЙ ДАЙДЖЕСТ НА СЕГОДНЯ */}
       {(todayEvents.length > 0 || urgentProjects.length > 0 || staleRemarksCount > 0) && (
         <div className="bg-gradient-to-r from-indigo-50 via-white to-amber-50/70 rounded-xl border border-indigo-200/80 p-4 shadow-xs flex flex-col lg:flex-row lg:items-center justify-between gap-3">
           <div className="space-y-1">
@@ -1518,6 +2050,7 @@ function TabOverviewCalendar({
         </div>
       )}
 
+      {/* Карточки KPI */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
           <div className="text-xs font-medium text-slate-500">Активных проектов</div>
@@ -1536,12 +2069,106 @@ function TabOverviewCalendar({
           </div>
         </div>
         <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
-          <div className="text-xs font-medium text-slate-500">Задач в работе</div>
+          <div className="text-xs font-medium text-slate-500">Быстрых задач в работе</div>
           <div className="text-2xl font-bold text-indigo-600 mt-1">{totalOpenQuickTasks}</div>
         </div>
       </div>
 
-      {/* СВОДКА ПО ВСЕМ ПРОЕКТАМ */}
+      {/* В ФОКУСЕ / КАЛЬКУЛЯТОР ЗАГРУЗКИ ПО ВСЕМ ПРОЕКТАМ */}
+      <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
+        <div className="px-4 py-3 bg-slate-50/80 border-b border-slate-200/80 flex flex-wrap justify-between items-center gap-3">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <Flame size={17} className="text-amber-500" />
+            <h2 className="font-semibold text-sm text-slate-800">
+              В фокусе / План загрузки ({focusItems.length})
+            </h2>
+            <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200/80 flex items-center gap-1">
+              <Clock size={12} /> Суммарно: {totalFocusHours} ч
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <select
+              value={focusProjectFilter}
+              onChange={(e) => setFocusProjectFilter(e.target.value)}
+              className="px-2.5 py-1 text-xs bg-white border border-slate-200 rounded-lg text-slate-700 font-medium focus:outline-none"
+            >
+              <option value="">Все проекты</option>
+              {projects.map((p: any) => (
+                <option key={p.id} value={p.id}>
+                  Проект #{p.num} {p.name ? `— ${p.name}` : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {focusItems.length === 0 ? (
+          <div className="p-8 text-center text-xs text-slate-400">
+            Нет пунктов чек-листа со статусом «в работе» или «требует исправления».
+          </div>
+        ) : (
+          <div className="overflow-x-auto max-h-[340px] overflow-y-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead className="sticky top-0 bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-500 uppercase z-10">
+                <tr>
+                  <th className="py-2 px-3 w-28">Проект</th>
+                  <th className="py-2 px-2 w-24">Приоритет</th>
+                  <th className="py-2 px-3 min-w-[260px]">Пункт чек-листа</th>
+                  <th className="py-2 px-2 w-20 text-center">Время</th>
+                  <th className="py-2 px-3 w-48">Статус (изменить)</th>
+                  <th className="py-2 px-3 min-w-[160px]">Комментарий</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {focusItems.map((item) => (
+                  <tr key={`${item.projectId}-${item.taskIndex}`} className="hover:bg-slate-50/80">
+                    <td className="p-2.5">
+                      <button
+                        type="button"
+                        onClick={() => onOpenProject(item.projectId, 'tasks')}
+                        className="font-bold text-indigo-600 hover:text-indigo-800 hover:underline flex items-center gap-1"
+                        title={`Открыть проект #${item.projectNum}`}
+                      >
+                        #{item.projectNum}
+                        <ArrowUpRight size={12} />
+                      </button>
+                    </td>
+                    <td className="p-2.5">
+                      {item.priority ? (
+                        <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-900 font-semibold">
+                          {item.priority}
+                        </span>
+                      ) : (
+                        <span className="text-slate-300">—</span>
+                      )}
+                    </td>
+                    <td className="p-2.5 font-medium text-slate-700">
+                      {item.code && <span className="font-mono text-slate-400 mr-1.5">{item.code}</span>}
+                      {item.name}
+                    </td>
+                    <td className="p-2.5 text-center font-mono font-semibold text-slate-700">
+                      {item.estHours > 0 ? `${item.estHours} ч` : '—'}
+                    </td>
+                    <td className="p-2">
+                      <StatusPill
+                        value={item.status}
+                        options={DEFAULT_TASK_STATUSES}
+                        onChange={(val) => handleQuickUpdateFocusStatus(item.projectId, item.taskIndex, val)}
+                      />
+                    </td>
+                    <td className="p-2.5 text-slate-500 truncate max-w-[220px]" title={item.comment}>
+                      {item.comment || '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Краткая сводка по проектам */}
       <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
         <div className="px-4 py-3 bg-slate-50/80 border-b border-slate-200/80 flex flex-wrap justify-between items-center gap-2">
           <div className="flex items-center gap-2">
@@ -1682,7 +2309,7 @@ function TabOverviewCalendar({
         )}
       </div>
 
-      {/* КАЛЕНДАРЬ ПЛАНИРОВАНИЯ */}
+      {/* Календарь планирования */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
         <div className="lg:col-span-2 bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
           <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
@@ -1942,7 +2569,7 @@ function TabOverviewCalendar({
                           )
                         }
                         className="text-slate-400 hover:text-indigo-600 p-1 rounded"
-                        title="Скачать .ics для Google Calendar / Outlook"
+                        title="Скачать .ics для Outlook / Google Calendar"
                       >
                         <CalendarPlus size={14} />
                       </button>
@@ -1971,9 +2598,279 @@ function TabOverviewCalendar({
   );
 }
 
-// === 7. ВКЛАДКА 1: ВСТРЕЧИ ===
+// === 8. МОДАЛЬНОЕ ОКНО ОТЧЁТА ПО ВСТРЕЧАМ (WORD / OUTLOOK) ===
 
-function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFilter, onClearExternalFilter }: any) {
+function MeetingsReportModal({
+  filteredMeetings,
+  filters,
+  projects,
+  onClose,
+}: {
+  filteredMeetings: any[];
+  filters: {
+    projectNum: string;
+    date: string;
+    desc: string;
+    fix: string;
+    screenshot: string;
+    status: string;
+    comment: string;
+  };
+  projects: any[];
+  onClose: () => void;
+}) {
+  const matchedProject = filters.projectNum
+    ? projects.find((p: any) => (p.num || '').trim() === filters.projectNum.trim())
+    : null;
+
+  const defaultTitle = [
+    'Протокол / Итоги встречи',
+    filters.projectNum ? `по проекту #${filters.projectNum}` : '',
+    matchedProject?.name ? `(${matchedProject.name})` : '',
+    filters.date ? `от ${filters.date}` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+
+  const [reportTitle, setReportTitle] = useState(defaultTitle);
+  const [introNote, setIntroNote] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  const plainTextReport = useMemo(() => {
+    const lines: string[] = [];
+    lines.push(reportTitle.toUpperCase());
+    lines.push(`Дата формирования: ${getTodayDMY()} | Пунктов в протоколе: ${filteredMeetings.length}`);
+    if (introNote.trim()) {
+      lines.push('');
+      lines.push(`Резюме: ${introNote.trim()}`);
+    }
+    lines.push('');
+
+    filteredMeetings.forEach((m: any, idx: number) => {
+      const headerParts = [
+        `${idx + 1}.`,
+        m.projectNum ? `[Проект #${m.projectNum}]` : '',
+        m.date ? `(${formatToDMY(m.date)})` : '',
+        m.status ? `— Статус: ${m.status}` : '',
+      ].filter(Boolean);
+      lines.push(headerParts.join(' '));
+      if (m.desc) lines.push(`   Вопрос: ${m.desc}`);
+      if (m.fix) lines.push(`   Решение / Что исправить: ${m.fix}`);
+      if (m.comment) lines.push(`   Комментарий: ${m.comment}`);
+      lines.push('');
+    });
+
+    return lines.join('\n');
+  }, [reportTitle, introNote, filteredMeetings]);
+
+  const handleCopyForOutlook = () => {
+    navigator.clipboard.writeText(plainTextReport);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2500);
+  };
+
+  const handleOpenOutlookMailto = () => {
+    const subject = encodeURIComponent(reportTitle);
+    const body = encodeURIComponent(plainTextReport);
+    window.location.href = `mailto:?subject=${subject}&body=${body}`;
+  };
+
+  const handleDownloadWord = () => {
+    const escapeHtml = (str: string) =>
+      String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\n/g, '<br/>');
+
+    const rowsHtml = filteredMeetings
+      .map((m: any, idx: number) => {
+        const imgs = normalizeScreenshots(m.screenshot);
+        const imgsHtml =
+          imgs.length > 0
+            ? imgs
+                .map(
+                  (src) =>
+                    `<div style="margin-bottom:4px;"><img src="${src}" width="150" style="max-width:150px;height:auto;" /></div>`
+                )
+                .join('')
+            : '—';
+
+        return `
+          <tr>
+            <td align="center">${idx + 1}</td>
+            <td align="center"><b>${escapeHtml(m.projectNum || '—')}</b></td>
+            <td align="center">${escapeHtml(formatToDMY(m.date))}</td>
+            <td>${escapeHtml(m.desc)}</td>
+            <td>${escapeHtml(m.fix)}</td>
+            <td align="center">${imgsHtml}</td>
+            <td><b>${escapeHtml(m.status)}</b></td>
+            <td>${escapeHtml(m.comment)}</td>
+          </tr>
+        `;
+      })
+      .join('');
+
+    const fullHtml = `
+      <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+      <head><meta charset='utf-8'><title>${escapeHtml(reportTitle)}</title></head>
+      <body style="font-family: Arial, sans-serif; font-size: 10.5pt; color: #1e293b;">
+        <h1 style="color:#1e3a8a;margin-bottom:4px;">${escapeHtml(reportTitle)}</h1>
+        <p style="color:#475569;margin-top:0;">
+          <b>Дата выгрузки:</b> ${getTodayDMY()} &nbsp;|&nbsp;
+          <b>Количество пунктов:</b> ${filteredMeetings.length}
+        </p>
+        ${
+          introNote.trim()
+            ? `<p style="background:#f8fafc;padding:8px 12px;border-left:3px solid #4f46e5;"><b>Краткое резюме:</b> ${escapeHtml(
+                introNote.trim()
+              )}</p>`
+            : ''
+        }
+        <table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;width:100%;font-size:9.5pt;">
+          <thead>
+            <tr style="background:#f1f5f9;">
+              <th style="width:30px;">№</th>
+              <th style="width:65px;">Проект</th>
+              <th style="width:80px;">Дата</th>
+              <th>Описание вопроса</th>
+              <th>Что исправить / Решение</th>
+              <th style="width:160px;">Скриншоты</th>
+              <th style="width:95px;">Статус</th>
+              <th>Комментарий</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rowsHtml}
+          </tbody>
+        </table>
+      </body>
+      </html>
+    `;
+
+    const blob = new Blob(['\uFEFF', fullHtml], { type: 'application/msword;charset=utf-8' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    const fileProj = filters.projectNum ? `_${filters.projectNum}` : '';
+    const fileDate = filters.date ? `_${filters.date.replace(/\//g, '-')}` : '';
+    link.download = `Meeting_Report${fileProj}${fileDate}.doc`;
+    link.click();
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-4xl w-full max-h-[90vh] flex flex-col overflow-hidden">
+        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50/80">
+          <div className="flex items-center gap-2.5">
+            <FileText size={20} className="text-indigo-600" />
+            <div>
+              <h3 className="font-bold text-slate-800 text-base">
+                Отчёт по результатам встреч ({filteredMeetings.length} зап.)
+              </h3>
+              <p className="text-xs text-slate-500">
+                Сформировано по текущим фильтрам таблицы «Встречи» — можно выгрузить в Word или отправить через Outlook
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-200/60"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="p-4 bg-slate-50/50 border-b border-slate-200 space-y-2.5 text-xs">
+          <div>
+            <label className="block font-semibold text-slate-700 mb-1">Заголовок протокола / Тема письма:</label>
+            <input
+              type="text"
+              value={reportTitle}
+              onChange={(e) => setReportTitle(e.target.value)}
+              className="w-full px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-800 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+            />
+          </div>
+          <div>
+            <label className="block font-semibold text-slate-700 mb-1">
+              Краткое резюме / Выводы по встрече (необязательно):
+            </label>
+            <textarea
+              rows={2}
+              value={introNote}
+              onChange={(e) => setIntroNote(e.target.value)}
+              placeholder="Например: Провели суперпозицию с архитектором и конструктором. Основные правки по стоякам канализации и приямкам..."
+              className="w-full px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-slate-700 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+            />
+          </div>
+        </div>
+
+        <div className="p-4 flex-grow overflow-y-auto bg-white">
+          <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">
+            Предпросмотр текста для Outlook (при экспорте в Word также добавятся все скриншоты):
+          </div>
+          <textarea
+            readOnly
+            value={plainTextReport}
+            className="w-full h-64 p-3 text-xs font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none leading-relaxed"
+          />
+        </div>
+
+        <div className="px-5 py-3.5 border-t border-slate-200 bg-slate-50/80 flex flex-wrap justify-between items-center gap-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="px-4 py-2 text-xs font-medium text-slate-600 hover:bg-slate-200/70 rounded-lg"
+          >
+            Закрыть
+          </button>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleCopyForOutlook}
+              className={`px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
+                copied
+                  ? 'bg-emerald-600 text-white border-emerald-600'
+                  : 'bg-white hover:bg-slate-100 text-slate-800 border-slate-300'
+              }`}
+            >
+              {copied ? <Check size={14} /> : <Copy size={14} />}
+              {copied ? 'Скопировано!' : 'Копировать текст'}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleOpenOutlookMailto}
+              className="bg-sky-600 hover:bg-sky-700 text-white px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-xs transition-colors"
+              title="Открыть новое письмо в почтовом клиенте Outlook с заполненной темой и текстом"
+            >
+              <Mail size={14} /> Открыть в Outlook
+            </button>
+
+            <button
+              type="button"
+              onClick={handleDownloadWord}
+              className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-colors"
+            >
+              <Download size={14} /> Скачать в Word (.doc)
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// === 9. ВКЛАДКА 1: ВСТРЕЧИ ===
+
+function TabMeetings({
+  meetings,
+  setMeetings,
+  projects,
+  onPreviewImages,
+  externalProjectFilter,
+  onClearExternalFilter,
+}: any) {
   const [filters, setFilters] = useState({
     projectNum: '',
     date: '',
@@ -1983,6 +2880,7 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
     status: '',
     comment: '',
   });
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
 
   useEffect(() => {
     if (externalProjectFilter) {
@@ -1996,14 +2894,15 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
     setFilters({ projectNum: '', date: '', desc: '', fix: '', screenshot: '', status: '', comment: '' });
 
   const filtered = meetings.filter((m: any) => {
+    const imgs = normalizeScreenshots(m.screenshot);
     return (
       (!filters.projectNum || (m.projectNum || '').toLowerCase().includes(filters.projectNum.toLowerCase())) &&
       matchDateFilter(m.date, filters.date) &&
       (!filters.desc || (m.desc || '').toLowerCase().includes(filters.desc.toLowerCase())) &&
       (!filters.fix || (m.fix || '').toLowerCase().includes(filters.fix.toLowerCase())) &&
       (!filters.screenshot ||
-        (filters.screenshot === 'yes' && Boolean(m.screenshot)) ||
-        (filters.screenshot === 'no' && !m.screenshot)) &&
+        (filters.screenshot === 'yes' && imgs.length > 0) ||
+        (filters.screenshot === 'no' && imgs.length === 0)) &&
       matchStatusFilter(m.status, filters.status) &&
       (!filters.comment || (m.comment || '').toLowerCase().includes(filters.comment.toLowerCase()))
     );
@@ -2013,14 +2912,35 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
     setMeetings(meetings.map((m: any) => (m.id === id ? { ...m, [field]: value } : m)));
   };
 
+  const appendScreenshotToItem = (id: any, newImg: string) => {
+    setMeetings((prev: any[]) =>
+      prev.map((m: any) => {
+        if (m.id !== id) return m;
+        const current = normalizeScreenshots(m.screenshot);
+        return { ...m, screenshot: [...current, newImg] };
+      })
+    );
+  };
+
   return (
     <div className="space-y-4">
+      {isReportModalOpen && (
+        <MeetingsReportModal
+          filteredMeetings={filtered}
+          filters={filters}
+          projects={projects}
+          onClose={() => setIsReportModalOpen(false)}
+        />
+      )}
+
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
         <div>
           <h2 className="text-lg font-semibold text-slate-800">Протоколы и результаты встреч</h2>
-          <p className="text-xs text-slate-500">Фильтрация по всем колонкам (формат даты: ДД/ММ/ГГГГ)</p>
+          <p className="text-xs text-slate-500">
+            Отфильтруйте по проекту или дате и нажмите «Отчёт / Outlook», чтобы сформировать протокол
+          </p>
         </div>
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           {hasActiveFilters && (
             <button
               onClick={resetFilters}
@@ -2030,15 +2950,24 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
             </button>
           )}
           <button
+            type="button"
+            disabled={filtered.length === 0}
+            onClick={() => setIsReportModalOpen(true)}
+            className="bg-amber-50 hover:bg-amber-100 disabled:opacity-50 text-amber-800 border border-amber-200 px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors whitespace-nowrap"
+            title="Сформировать протокол по отфильтрованным строкам для Word или Outlook"
+          >
+            <FileText size={15} /> Отчёт / Outlook ({filtered.length})
+          </button>
+          <button
             onClick={() =>
               setMeetings([
                 {
                   id: Date.now(),
                   projectNum: filters.projectNum || '',
-                  date: getTodayDMY(),
+                  date: filters.date || getTodayDMY(),
                   desc: '',
                   fix: '',
-                  screenshot: '',
+                  screenshot: [],
                   status: 'в работе',
                   comment: '',
                 },
@@ -2061,7 +2990,7 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
                 <th className="pt-3 pb-1.5 px-3 w-36">Дата</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[220px]">Описание вопроса</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[220px]">Что исправить</th>
-                <th className="pt-3 pb-1.5 px-3 w-32 text-center">Скриншот</th>
+                <th className="pt-3 pb-1.5 px-3 w-44 text-center">Скриншоты</th>
                 <th className="pt-3 pb-1.5 px-3 w-44">Статус</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[160px]">Комментарий</th>
                 <th className="pt-3 pb-1.5 px-2 w-10"></th>
@@ -2133,7 +3062,7 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
                 filtered.map((m: any) => (
                   <tr
                     key={m.id}
-                    onPaste={(e) => handlePasteImage(e, (img) => updateItem(m.id, 'screenshot', img))}
+                    onPaste={(e) => handlePasteImage(e, (img) => appendScreenshotToItem(m.id, img))}
                     className="group hover:bg-slate-50/70 transition-colors align-top"
                   >
                     <td className="p-2">
@@ -2167,8 +3096,8 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
                     <td className="p-2 text-center">
                       <ImageCell
                         src={m.screenshot}
-                        onChange={(img) => updateItem(m.id, 'screenshot', img)}
-                        onPreview={onPreviewImage}
+                        onChange={(imgs) => updateItem(m.id, 'screenshot', imgs)}
+                        onPreview={onPreviewImages}
                       />
                     </td>
                     <td className="p-2">
@@ -2206,7 +3135,7 @@ function TabMeetings({ meetings, setMeetings, onPreviewImage, externalProjectFil
   );
 }
 
-// === 8. МОДАЛЬНОЕ ОКНО ФОРМИРОВАНИЯ СТАТУСА ПРОЕКТА (ПИСЬМО / WORD / ШАБЛОНЫ ИВРИТ) ===
+// === 10. МОДАЛЬНОЕ ОКНО ФОРМИРОВАНИЯ СТАТУСА ПРОЕКТА (WORD / ШАБЛОНЫ ИВРИТ) ===
 
 function ProjectStatusExportModal({
   projectData,
@@ -2414,29 +3343,35 @@ function ProjectStatusExportModal({
                     <th style="width:85px;">Дата</th>
                     <th style="width:110px;">Кому / От</th>
                     <th>Описание</th>
-                    <th style="width:140px;">Скриншот</th>
+                    <th style="width:140px;">Скриншоты</th>
                     <th>Решение</th>
                     <th style="width:100px;">Статус</th>
                   </tr>
                 </thead>
                 <tbody>
                   ${filteredRemarks
-                    .map(
-                      (r: any, idx: number) => `
+                    .map((r: any, idx: number) => {
+                      const imgs = normalizeScreenshots(r.screenshot);
+                      const imgsHtml =
+                        imgs.length > 0
+                          ? imgs
+                              .map(
+                                (imgSrc) =>
+                                  `<div style="margin-bottom:4px;"><img src="${imgSrc}" width="130" style="max-width:130px;height:auto;" /></div>`
+                              )
+                              .join('')
+                          : '—';
+                      return `
                     <tr>
                       <td align="center">${idx + 1}</td>
                       <td>${escapeHtml(formatToDMY(r.date))}</td>
                       <td>${escapeHtml(r.to)}</td>
                       <td>${escapeHtml(r.desc)}</td>
-                      <td align="center">${
-                        r.screenshot
-                          ? `<img src="${r.screenshot}" width="130" style="max-width:130px;height:auto;" />`
-                          : '—'
-                      }</td>
+                      <td align="center">${imgsHtml}</td>
                       <td>${escapeHtml(r.resolution)}</td>
                       <td><b>${escapeHtml(r.status)}</b></td>
-                    </tr>`
-                    )
+                    </tr>`;
+                    })
                     .join('')}
                 </tbody>
               </table>`);
@@ -2533,7 +3468,6 @@ function ProjectStatusExportModal({
           </button>
         </div>
 
-        {/* Переключатель режима: Статус (Word) / Шаблон письма на иврите */}
         <div className="px-5 pt-3 bg-slate-50/50 border-b border-slate-200 flex gap-2">
           <button
             type="button"
@@ -2703,7 +3637,7 @@ function ProjectStatusExportModal({
   );
 }
 
-// === 9. ВКЛАДКА 2: СТАТУС ПРОЕКТА ===
+// === 11. ВКЛАДКА 2: СТАТУС ПРОЕКТА ===
 
 function TabProjectStatus({
   projects,
@@ -2715,7 +3649,7 @@ function TabProjectStatus({
   tasks,
   setTasks,
   onNavigateWithFilter,
-  onPreviewImage,
+  onPreviewImages,
   onSyncSingleProjectToReport,
   externalSubTab,
   onClearExternalSubTab,
@@ -2733,7 +3667,6 @@ function TabProjectStatus({
   const [customTaskName, setCustomTaskName] = useState('');
   const [copiedRemarks, setCopiedRemarks] = useState(false);
 
-  // Массовый выбор задач в чек-листе
   const [selectedTaskIndices, setSelectedTaskIndices] = useState<number[]>([]);
   const [bulkStatusValue, setBulkStatusValue] = useState('выполнено');
 
@@ -3123,6 +4056,16 @@ function TabProjectStatus({
     setMeetings(meetings.map((m: any) => (m.id === id ? { ...m, [field]: value } : m)));
   };
 
+  const appendScreenshotToMeetingRow = (id: any, newImg: string) => {
+    setMeetings((prev: any[]) =>
+      prev.map((m: any) => {
+        if (m.id !== id) return m;
+        const current = normalizeScreenshots(m.screenshot);
+        return { ...m, screenshot: [...current, newImg] };
+      })
+    );
+  };
+
   const updateQuickTaskRow = (id: any, field: string, value: any) => {
     setTasks(tasks.map((t: any) => (t.id === id ? { ...t, [field]: value } : t)));
   };
@@ -3131,7 +4074,6 @@ function TabProjectStatus({
 
   return (
     <div className="space-y-5">
-      {/* Быстрый переключатель объектов */}
       {projects.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
           <button
@@ -3238,7 +4180,6 @@ function TabProjectStatus({
         </div>
       )}
 
-      {/* Панель выбора проекта и основных действий */}
       <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm space-y-3">
         <div className="flex flex-col md:flex-row justify-between items-stretch md:items-center gap-3">
           <div className="flex flex-wrap items-center gap-3 flex-grow">
@@ -3303,7 +4244,6 @@ function TabProjectStatus({
           </div>
         </div>
 
-        {/* ПАСПОРТ ОБЪЕКТА */}
         {projectData && (
           <div className="pt-3 border-t border-slate-100 grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className="flex items-center gap-2 bg-slate-50/70 px-3 py-1.5 rounded-lg border border-slate-200/70">
@@ -3428,7 +4368,6 @@ function TabProjectStatus({
             />
           )}
 
-          {/* БЛОКЕРЫ ПО ПРОЕКТУ */}
           <div className="bg-white rounded-xl border border-rose-200/80 shadow-sm overflow-hidden">
             <div className="px-4 py-3 bg-rose-50/60 border-b border-rose-100 flex flex-wrap justify-between items-center gap-2">
               <div className="flex items-center gap-2">
@@ -3508,7 +4447,6 @@ function TabProjectStatus({
             </div>
           </div>
 
-          {/* Внутренняя навигация по разделам проекта */}
           <div className="flex flex-wrap gap-1.5 bg-slate-200/60 p-1 rounded-xl w-fit">
             {[
               { id: 'tasks', label: 'Инженерия (Чек-лист)', icon: Layers, count: projectData.tasks.filter((t: any) => !t.isHeader).length },
@@ -3543,7 +4481,7 @@ function TabProjectStatus({
             })}
           </div>
 
-          {/* РАЗДЕЛ 1: ИНЖЕНЕРНЫЕ ЗАДАЧИ + МАССОВОЕ ИЗМЕНЕНИЕ СТАТУСА */}
+          {/* РАЗДЕЛ 1: ИНЖЕНЕРНЫЕ ЗАДАЧИ */}
           {subTab === 'tasks' && (
             <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
               <datalist id="project-priorities-list">
@@ -3552,7 +4490,6 @@ function TabProjectStatus({
                 ))}
               </datalist>
 
-              {/* Панель массового изменения статуса при выделении чекбоксами */}
               {selectedTaskIndices.length > 0 && (
                 <div className="px-4 py-2.5 bg-indigo-600 text-white flex flex-wrap items-center justify-between gap-3">
                   <div className="text-xs font-semibold">
@@ -4110,14 +5047,14 @@ function TabProjectStatus({
             </div>
           )}
 
-          {/* РАЗДЕЛ 2: ЗАМЕЧАНИЯ ПО ПРОЕКТУ (С ПОДСВЕТКОЙ ЗАВИСШИХ > 5 ДНЕЙ) */}
+          {/* РАЗДЕЛ 2: ЗАМЕЧАНИЯ ПО ПРОЕКТУ */}
           {subTab === 'remarks' && (
             <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
               <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
                 <div>
                   <h3 className="font-semibold text-slate-800">Реестр замечаний и координации</h3>
                   <p className="text-xs text-slate-400">
-                    Замечания без ответа дольше 5 дней подсвечиваются автоматически. Скриншот вставляется по Ctrl+V с автосжатием
+                    Можно прикрепить несколько скриншотов в одну строку и нанести пометки по клику. Замечания без ответа &gt; 5 дней подсвечиваются
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -4152,7 +5089,7 @@ function TabProjectStatus({
                           date: getTodayDMY(),
                           to: '',
                           desc: '',
-                          screenshot: '',
+                          screenshot: [],
                           dateSent: '',
                           dateAnswer: '',
                           resolution: '',
@@ -4175,7 +5112,7 @@ function TabProjectStatus({
                       <th className="pt-2.5 pb-1.5 px-2 w-36">Дата</th>
                       <th className="pt-2.5 pb-1.5 px-2 w-32">Кому / От</th>
                       <th className="pt-2.5 pb-1.5 px-2 min-w-[200px]">Описание</th>
-                      <th className="pt-2.5 pb-1.5 px-2 w-32 text-center">Скрин</th>
+                      <th className="pt-2.5 pb-1.5 px-2 w-44 text-center">Скриншоты</th>
                       <th className="pt-2.5 pb-1.5 px-2 w-36">Отправлено</th>
                       <th className="pt-2.5 pb-1.5 px-2 w-36">Ответ</th>
                       <th className="pt-2.5 pb-1.5 px-2 min-w-[180px]">Решение</th>
@@ -4239,7 +5176,8 @@ function TabProjectStatus({
                             onPaste={(e) =>
                               handlePasteImage(e, (img) => {
                                 const arr = [...projectData.remarks];
-                                arr[i].screenshot = img;
+                                const current = normalizeScreenshots(arr[i].screenshot);
+                                arr[i].screenshot = [...current, img];
                                 updateField('remarks', arr);
                               })
                             }
@@ -4284,12 +5222,12 @@ function TabProjectStatus({
                             <td className="p-2 text-center">
                               <ImageCell
                                 src={r.screenshot}
-                                onChange={(img) => {
+                                onChange={(imgs) => {
                                   const arr = [...projectData.remarks];
-                                  arr[i].screenshot = img;
+                                  arr[i].screenshot = imgs;
                                   updateField('remarks', arr);
                                 }}
-                                onPreview={onPreviewImage}
+                                onPreview={onPreviewImages}
                               />
                             </td>
                             <td className="p-2">
@@ -4365,7 +5303,7 @@ function TabProjectStatus({
             </div>
           )}
 
-          {/* РАЗДЕЛ 3: ЖУРНАЛ ВЫДАЧИ МОДЕЛЕЙ И РЕВИЗИЙ (REVIT / DWG / PDF) */}
+          {/* РАЗДЕЛ 3: ЖУРНАЛ ВЫДАЧИ МОДЕЛЕЙ И РЕВИЗИЙ */}
           {subTab === 'revisions' && (
             <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
               <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
@@ -4719,12 +5657,24 @@ function TabProjectStatus({
                 <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
                   <div>
                     <h3 className="font-semibold text-slate-800">
-                      Все встречи по проекту #{projectData.num} ({projectMeetings.length})
+                      Протоколы встреч по проекту {projectData.num} ({projectMeetings.length})
                     </h3>
+                    <p className="text-xs text-slate-400">
+                      Все изменения синхронизируются с общей вкладкой «Встречи»
+                    </p>
                   </div>
                   <div className="flex items-center gap-2">
+                    {Object.values(relMeetingFilters).some(Boolean) && (
+                      <button
+                        onClick={() =>
+                          setRelMeetingFilters({ date: '', desc: '', fix: '', status: '', comment: '' })
+                        }
+                        className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1 rounded-lg flex items-center gap-1"
+                      >
+                        <RotateCcw size={12} /> Сбросить
+                      </button>
+                    )}
                     <button
-                      type="button"
                       onClick={() =>
                         setMeetings([
                           {
@@ -4733,23 +5683,22 @@ function TabProjectStatus({
                             date: getTodayDMY(),
                             desc: '',
                             fix: '',
-                            screenshot: '',
+                            screenshot: [],
                             status: 'в работе',
                             comment: '',
                           },
                           ...meetings,
                         ])
                       }
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 shadow-xs"
                     >
-                      <Plus size={14} /> Добавить встречу
+                      <Plus size={14} /> Новая встреча
                     </button>
                     <button
-                      type="button"
                       onClick={() => onNavigateWithFilter(1, projectData.num)}
                       className="text-xs font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 px-3 py-1.5 rounded-lg"
                     >
-                      Открыть во вкладке «Встречи» →
+                      В общий список →
                     </button>
                   </div>
                 </div>
@@ -4757,57 +5706,57 @@ function TabProjectStatus({
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse text-sm">
                     <thead>
-                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                        <th className="pt-2.5 pb-1.5 px-2 w-36">Дата</th>
-                        <th className="pt-2.5 pb-1.5 px-2 min-w-[210px]">Описание вопроса</th>
-                        <th className="pt-2.5 pb-1.5 px-2 min-w-[210px]">Что исправить</th>
-                        <th className="pt-2.5 pb-1.5 px-2 w-32 text-center">Скриншот</th>
-                        <th className="pt-2.5 pb-1.5 px-2 w-44">Статус</th>
-                        <th className="pt-2.5 pb-1.5 px-2 min-w-[160px]">Комментарий</th>
+                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дата</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Описание вопроса</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Что исправить</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-44 text-center">Скриншоты</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-44">Статус</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[150px]">Комментарий</th>
                         <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
                       </tr>
                       <tr className="bg-slate-50/40 border-b border-slate-200">
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relMeetingFilters.date}
                             onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, date: v })}
                             placeholder="ДД/ММ/ГГГГ"
                           />
                         </th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relMeetingFilters.desc}
                             onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, desc: v })}
                           />
                         </th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relMeetingFilters.fix}
                             onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, fix: v })}
                           />
                         </th>
-                        <th className="pb-2 px-1.5"></th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2"></th>
+                        <th className="pb-2 px-2">
                           <ColSelectFilter
                             value={relMeetingFilters.status}
                             options={['в работе', 'исправлено', 'на паузе', 'передано другому']}
                             onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, status: v })}
                           />
                         </th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relMeetingFilters.comment}
                             onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, comment: v })}
                           />
                         </th>
-                        <th className="pb-2 px-1.5"></th>
+                        <th className="pb-2 px-2"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {projectMeetings.length === 0 ? (
                         <tr>
-                          <td colSpan={7} className="py-8 text-center text-xs text-slate-400">
-                            По проекту #{projectData.num} записей встреч пока нет.
+                          <td colSpan={7} className="py-10 text-center text-xs text-slate-400">
+                            По проекту {projectData.num} записей встреч пока нет.
                           </td>
                         </tr>
                       ) : (
@@ -4826,10 +5775,8 @@ function TabProjectStatus({
                           .map((m: any) => (
                             <tr
                               key={m.id}
-                              onPaste={(e) =>
-                                handlePasteImage(e, (img) => updateMeetingRow(m.id, 'screenshot', img))
-                              }
-                              className="group hover:bg-slate-50/70 align-top"
+                              onPaste={(e) => handlePasteImage(e, (img) => appendScreenshotToMeetingRow(m.id, img))}
+                              className="group hover:bg-slate-50/70 transition-colors align-top"
                             >
                               <td className="p-2">
                                 <DateInput
@@ -4842,22 +5789,20 @@ function TabProjectStatus({
                                   value={m.desc}
                                   onChange={(val) => updateMeetingRow(m.id, 'desc', val)}
                                   placeholder="Суть вопроса..."
-                                  className="text-xs"
                                 />
                               </td>
                               <td className="p-2">
                                 <AutoTextarea
                                   value={m.fix}
                                   onChange={(val) => updateMeetingRow(m.id, 'fix', val)}
-                                  placeholder="Что исправить..."
-                                  className="text-xs"
+                                  placeholder="Требуемые правки..."
                                 />
                               </td>
                               <td className="p-2 text-center">
                                 <ImageCell
                                   src={m.screenshot}
-                                  onChange={(img) => updateMeetingRow(m.id, 'screenshot', img)}
-                                  onPreview={onPreviewImage}
+                                  onChange={(imgs) => updateMeetingRow(m.id, 'screenshot', imgs)}
+                                  onPreview={onPreviewImages}
                                 />
                               </td>
                               <td className="p-2">
@@ -4871,14 +5816,15 @@ function TabProjectStatus({
                                 <AutoTextarea
                                   value={m.comment}
                                   onChange={(val) => updateMeetingRow(m.id, 'comment', val)}
-                                  placeholder="Комментарий..."
-                                  className="text-xs text-slate-600"
+                                  placeholder="Заметка..."
+                                  className="text-slate-600 text-xs"
                                 />
                               </td>
                               <td className="p-2 text-center">
                                 <button
                                   onClick={() => setMeetings(meetings.filter((mtg: any) => mtg.id !== m.id))}
-                                  className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                                  className="text-slate-300 hover:text-rose-500 p-1 rounded opacity-0 group-hover:opacity-100 transition-all"
+                                  title="Удалить запись"
                                 >
                                   <Trash2 size={14} />
                                 </button>
@@ -4895,18 +5841,30 @@ function TabProjectStatus({
                 <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
                   <div>
                     <h3 className="font-semibold text-slate-800">
-                      Все быстрые задачи по проекту #{projectData.num} ({projectQuickTasks.length})
+                      Быстрые задачи по проекту {projectData.num} ({projectQuickTasks.length})
                     </h3>
+                    <p className="text-xs text-slate-400">
+                      Все изменения синхронизируются с общей вкладкой «Задачи»
+                    </p>
                   </div>
                   <div className="flex items-center gap-2">
+                    {Object.values(relTaskFilters).some(Boolean) && (
+                      <button
+                        onClick={() =>
+                          setRelTaskFilters({ date: '', desc: '', estDate: '', status: '', comment: '' })
+                        }
+                        className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1 rounded-lg flex items-center gap-1"
+                      >
+                        <RotateCcw size={12} /> Сбросить
+                      </button>
+                    )}
                     <button
-                      type="button"
                       onClick={() =>
                         setTasks([
                           {
                             id: Date.now(),
-                            date: getTodayDMY(),
                             project: projectData.num,
+                            date: getTodayDMY(),
                             desc: '',
                             estDate: '',
                             status: 'в работе',
@@ -4915,16 +5873,15 @@ function TabProjectStatus({
                           ...tasks,
                         ])
                       }
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 shadow-xs"
                     >
-                      <Plus size={14} /> Добавить задачу
+                      <Plus size={14} /> Новая задача
                     </button>
                     <button
-                      type="button"
                       onClick={() => onNavigateWithFilter(4, projectData.num)}
                       className="text-xs font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 px-3 py-1.5 rounded-lg"
                     >
-                      Открыть во вкладке «Быстрые задачи» →
+                      В общий список →
                     </button>
                   </div>
                 </div>
@@ -4932,56 +5889,56 @@ function TabProjectStatus({
                 <div className="overflow-x-auto">
                   <table className="w-full text-left border-collapse text-sm">
                     <thead>
-                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                        <th className="pt-2.5 pb-1.5 px-2 w-36">Создано</th>
-                        <th className="pt-2.5 pb-1.5 px-2 min-w-[260px]">Описание задачи</th>
-                        <th className="pt-2.5 pb-1.5 px-2 w-36">Дедлайн</th>
-                        <th className="pt-2.5 pb-1.5 px-2 w-44">Статус</th>
-                        <th className="pt-2.5 pb-1.5 px-2 min-w-[180px]">Комментарий</th>
+                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дата постановки</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[260px]">Описание задачи</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дедлайн</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-44">Статус</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Комментарий</th>
                         <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
                       </tr>
                       <tr className="bg-slate-50/40 border-b border-slate-200">
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relTaskFilters.date}
                             onChange={(v) => setRelTaskFilters({ ...relTaskFilters, date: v })}
                             placeholder="ДД/ММ/ГГГГ"
                           />
                         </th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relTaskFilters.desc}
                             onChange={(v) => setRelTaskFilters({ ...relTaskFilters, desc: v })}
                           />
                         </th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relTaskFilters.estDate}
                             onChange={(v) => setRelTaskFilters({ ...relTaskFilters, estDate: v })}
                             placeholder="ДД/ММ/ГГГГ"
                           />
                         </th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColSelectFilter
                             value={relTaskFilters.status}
                             options={['в работе', 'выполнена', 'на паузе', 'передано']}
                             onChange={(v) => setRelTaskFilters({ ...relTaskFilters, status: v })}
                           />
                         </th>
-                        <th className="pb-2 px-1.5">
+                        <th className="pb-2 px-2">
                           <ColTextFilter
                             value={relTaskFilters.comment}
                             onChange={(v) => setRelTaskFilters({ ...relTaskFilters, comment: v })}
                           />
                         </th>
-                        <th className="pb-2 px-1.5"></th>
+                        <th className="pb-2 px-2"></th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {projectQuickTasks.length === 0 ? (
                         <tr>
-                          <td colSpan={6} className="py-8 text-center text-xs text-slate-400">
-                            По проекту #{projectData.num} быстрых задач пока нет.
+                          <td colSpan={6} className="py-10 text-center text-xs text-slate-400">
+                            По проекту {projectData.num} быстрых задач пока нет.
                           </td>
                         </tr>
                       ) : (
@@ -5009,7 +5966,6 @@ function TabProjectStatus({
                                   value={t.desc}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'desc', val)}
                                   placeholder="Что нужно сделать..."
-                                  className="text-xs"
                                 />
                               </td>
                               <td className="p-2">
@@ -5029,14 +5985,15 @@ function TabProjectStatus({
                                 <AutoTextarea
                                   value={t.comment}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'comment', val)}
-                                  placeholder="Примечание..."
+                                  placeholder="Комментарий..."
                                   className="text-xs text-slate-600"
                                 />
                               </td>
                               <td className="p-2 text-center">
                                 <button
-                                  onClick={() => setTasks(tasks.filter((task: any) => task.id !== t.id))}
+                                  onClick={() => setTasks(tasks.filter((item: any) => item.id !== t.id))}
                                   className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                                  title="Удалить задачу"
                                 >
                                   <Trash2 size={14} />
                                 </button>
@@ -5056,136 +6013,181 @@ function TabProjectStatus({
   );
 }
 
-// === 10. ВКЛАДКА 3: ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ ===
+// === 12. ВКЛАДКА 3: ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ ===
 
-function TabReports({ reports, setReports, projects, onSyncAllProjects }: any) {
+function TabWeeklyReport({ reports, setReports, projects }: any) {
   const [selectedWeek, setSelectedWeek] = useState(getCurrentISOWeek());
   const [filters, setFilters] = useState({
-    week: '',
-    projNum: '',
+    num: '',
+    name: '',
     stage: '',
+    deadline: '',
     done: '',
     inProgress: '',
     blockers: '',
-    dateTasks: '',
-    dateTotal: '',
   });
+  const [copiedReport, setCopiedReport] = useState(false);
 
   const hasActiveFilters = Object.values(filters).some(Boolean);
   const resetFilters = () =>
-    setFilters({ week: '', projNum: '', stage: '', done: '', inProgress: '', blockers: '', dateTasks: '', dateTotal: '' });
+    setFilters({ num: '', name: '', stage: '', deadline: '', done: '', inProgress: '', blockers: '' });
 
-  const filtered = reports.filter((r: any) => {
-    return (
-      (!filters.week || (r.week || '').toLowerCase().includes(filters.week.toLowerCase())) &&
-      (!filters.projNum || (r.projNum || '').toLowerCase().includes(filters.projNum.toLowerCase())) &&
-      (!filters.stage || (r.stage || '').toLowerCase().includes(filters.stage.toLowerCase())) &&
-      (!filters.done || (r.done || '').toLowerCase().includes(filters.done.toLowerCase())) &&
-      (!filters.inProgress || (r.inProgress || '').toLowerCase().includes(filters.inProgress.toLowerCase())) &&
-      (!filters.blockers || (r.blockers || '').toLowerCase().includes(filters.blockers.toLowerCase())) &&
-      matchDateFilter(r.dateTasks, filters.dateTasks) &&
-      matchDateFilter(r.dateTotal, filters.dateTotal)
-    );
-  });
+  const weekReports = reports
+    .filter((r: any) => r.week === selectedWeek)
+    .filter((r: any) => {
+      return (
+        (!filters.num || (r.num || '').toLowerCase().includes(filters.num.toLowerCase())) &&
+        (!filters.name || (r.name || '').toLowerCase().includes(filters.name.toLowerCase())) &&
+        (!filters.stage || (r.stage || '').toLowerCase().includes(filters.stage.toLowerCase())) &&
+        matchDateFilter(r.deadline, filters.deadline) &&
+        (!filters.done || (r.done || '').toLowerCase().includes(filters.done.toLowerCase())) &&
+        (!filters.inProgress || (r.inProgress || '').toLowerCase().includes(filters.inProgress.toLowerCase())) &&
+        (!filters.blockers || (r.blockers || '').toLowerCase().includes(filters.blockers.toLowerCase()))
+      );
+    });
 
-  const updateItem = (id: any, field: string, value: any) => {
-    setReports(reports.map((r: any) => (r.id === id ? { ...r, [field]: value } : r)));
-  };
-
-  const refreshSingleRow = (row: any) => {
-    const proj = projects.find((p: any) => p.num === (row.projNum || '').trim());
-    if (!proj) {
-      alert(`Проект с номером "${row.projNum}" не найден в разделе «Статус проекта».`);
+  const handleSyncAllFromProjects = () => {
+    if (!projects.length) {
+      alert('Сначала добавьте хотя бы один проект во вкладке «Статус проекта».');
       return;
     }
-    const targetWeek = row.week || selectedWeek;
-    const summary = buildProjectReportSummary(proj, targetWeek);
-    setReports(
-      reports.map((r: any) =>
-        r.id === row.id
-          ? {
-              ...r,
-              week: targetWeek,
-              stage: summary.stage || r.stage,
-              done: summary.done,
-              inProgress: summary.inProgress,
-              blockers: summary.blockers,
-              dateTotal: summary.deadline || r.dateTotal,
-            }
-          : r
-      )
-    );
+
+    const otherWeeks = reports.filter((r: any) => r.week !== selectedWeek);
+    const currentWeekRows = [...reports.filter((r: any) => r.week === selectedWeek)];
+
+    projects.forEach((p: any, idx: number) => {
+      const summary = buildProjectReportSummary(p, selectedWeek);
+      const existingIndex = currentWeekRows.findIndex(
+        (r: any) => (r.num || '').trim() === (p.num || '').trim()
+      );
+
+      if (existingIndex >= 0) {
+        currentWeekRows[existingIndex] = {
+          ...currentWeekRows[existingIndex],
+          name: p.name || currentWeekRows[existingIndex].name,
+          stage: summary.stage || currentWeekRows[existingIndex].stage,
+          deadline: summary.deadline || currentWeekRows[existingIndex].deadline,
+          done: summary.done,
+          inProgress: summary.inProgress,
+          blockers: summary.blockers,
+        };
+      } else {
+        currentWeekRows.push({
+          id: Date.now() + idx,
+          week: selectedWeek,
+          num: p.num,
+          name: p.name || '',
+          stage: summary.stage,
+          deadline: summary.deadline,
+          done: summary.done,
+          inProgress: summary.inProgress,
+          blockers: summary.blockers,
+        });
+      }
+    });
+
+    setReports([...otherWeeks, ...currentWeekRows]);
+  };
+
+  const handleCopyReportText = () => {
+    if (!weekReports.length) return;
+    const lines = weekReports.map((r: any) => {
+      const parts = [
+        `▪ Проект ${r.num}${r.name ? ` (${r.name})` : ''}${r.stage ? ` [${r.stage}]` : ''}${
+          r.deadline ? ` — дедлайн: ${formatToDMY(r.deadline)}` : ''
+        }`,
+        `  Выполнено: ${r.done || 'На этой неделе ничего не выполнено'}`,
+        r.inProgress ? `  В работе: ${r.inProgress}` : '',
+        r.blockers ? `  Блокеры: ${r.blockers}` : '',
+      ].filter(Boolean);
+      return parts.join('\n');
+    });
+    const text = `Еженедельный отчет по проектам (${selectedWeek}):\n\n${lines.join('\n\n')}`;
+    navigator.clipboard.writeText(text);
+    setCopiedReport(true);
+    setTimeout(() => setCopiedReport(false), 2500);
   };
 
   return (
-    <div className="space-y-4 print-area">
-      <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm print-hidden">
-        <div>
-          <h2 className="text-lg font-semibold text-slate-800">Еженедельный отчет</h2>
-          <p className="text-xs text-slate-500">
-            1 строка = 1 проект. Все колонки доступны для ручного редактирования после автозаполнения
-          </p>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-1.5 bg-indigo-50/70 border border-indigo-200/80 px-2.5 py-1 rounded-lg">
+    <div className="space-y-4">
+      <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5">
+            <Calendar size={16} className="text-indigo-600" />
+            <span className="text-xs font-semibold text-slate-500">Неделя:</span>
             <input
               type="week"
               value={selectedWeek}
               onChange={(e) => setSelectedWeek(e.target.value)}
-              className="text-xs font-semibold text-indigo-900 bg-transparent focus:outline-none"
-              title="Выберите отчетную неделю"
+              className="bg-transparent text-sm font-semibold text-slate-800 focus:outline-none cursor-pointer"
             />
-            <button
-              onClick={() => onSyncAllProjects(selectedWeek)}
-              className="bg-indigo-600 hover:bg-indigo-700 text-white px-2.5 py-1 rounded-md text-xs font-medium flex items-center gap-1.5 shadow-xs transition-colors whitespace-nowrap"
-              title="Создать или обновить по 1 строке на каждый проект за выбранную неделю"
-            >
-              <RefreshCw size={13} /> Сформировать по проектам
-            </button>
           </div>
-
           {hasActiveFilters && (
             <button
               onClick={resetFilters}
               className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg flex items-center gap-1"
             >
-              <RotateCcw size={13} /> Сбросить
+              <RotateCcw size={13} /> Сбросить фильтры
             </button>
           )}
+        </div>
+
+        <div className="flex flex-wrap gap-2">
           <button
-            onClick={() => window.print()}
-            className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 transition-colors"
+            onClick={handleSyncAllFromProjects}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-xs transition-colors"
+            title="Собрать выполненные за эту неделю задачи, текущие работы и блокеры из всех проектов"
           >
-            <Printer size={15} /> PDF
+            <RefreshCw size={14} /> Заполнить из проектов
           </button>
           <button
-            onClick={() => exportToCSV(reports, 'reports.csv')}
-            className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 transition-colors"
+            onClick={handleCopyReportText}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 border transition-colors ${
+              copiedReport
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+            }`}
           >
-            <Download size={15} /> Excel
+            {copiedReport ? <Check size={14} /> : <Copy size={14} />}
+            {copiedReport ? 'Скопировано!' : 'Копировать текстом'}
           </button>
           <button
             onClick={() =>
               setReports([
+                ...reports,
                 {
                   id: Date.now(),
                   week: selectedWeek,
-                  projNum: '',
+                  num: '',
+                  name: '',
                   stage: '',
+                  deadline: '',
                   done: '',
                   inProgress: '',
                   blockers: '',
-                  dateTasks: '',
-                  dateTotal: '',
                 },
-                ...reports,
               ])
             }
-            className="bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1 transition-colors"
-            title="Добавить пустую строку вручную"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-xs"
           >
-            <Plus size={15} /> Пустая строка
+            <Plus size={15} /> Добавить строку
+          </button>
+          <button
+            onClick={() =>
+              exportToCSV(
+                weekReports.map(({ id, week, ...rest }: any) => rest),
+                `Отчет_${selectedWeek}.csv`
+              )
+            }
+            className="bg-slate-100 hover:bg-slate-200/80 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+          >
+            <FileSpreadsheet size={15} /> CSV
+          </button>
+          <button
+            onClick={() => window.print()}
+            className="bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+          >
+            <Printer size={15} /> Печать / PDF
           </button>
         </div>
       </div>
@@ -5195,137 +6197,120 @@ function TabReports({ reports, setReports, projects, onSyncAllProjects }: any) {
           <table className="w-full text-left border-collapse text-sm">
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                <th className="pt-3 pb-1.5 px-2 w-10 text-center">№</th>
-                <th className="pt-3 pb-1.5 px-2 w-36">Неделя</th>
-                <th className="pt-3 pb-1.5 px-2 w-24">Проект</th>
-                <th className="pt-3 pb-1.5 px-2 w-32">Стадия</th>
-                <th className="pt-3 pb-1.5 px-2 min-w-[190px]">Завершено (за неделю)</th>
-                <th className="pt-3 pb-1.5 px-2 min-w-[210px]">В работе / Передано</th>
-                <th className="pt-3 pb-1.5 px-2 min-w-[180px]">Блокирует</th>
-                <th className="pt-3 pb-1.5 px-2 w-36">Дата (задачи)</th>
-                <th className="pt-3 pb-1.5 px-2 w-36">Дата (этап)</th>
-                <th className="pt-3 pb-1.5 px-2 w-16 print-hidden"></th>
+                <th className="pt-3 pb-1.5 px-3 w-24">№ Пр.</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Проект</th>
+                <th className="pt-3 pb-1.5 px-3 w-28">Стадия</th>
+                <th className="pt-3 pb-1.5 px-3 w-32">Дедлайн</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Выполнено за неделю</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">В работе</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[180px]">Проблемы / Блокеры</th>
+                <th className="pt-3 pb-1.5 px-2 w-10 no-print"></th>
               </tr>
-              <tr className="bg-slate-50/40 border-b border-slate-200 print-hidden">
-                <th className="pb-2 px-1.5"></th>
-                <th className="pb-2 px-1.5">
-                  <ColTextFilter value={filters.week} onChange={(v) => setFilters({ ...filters, week: v })} placeholder="2026-W..." />
+              <tr className="bg-slate-50/40 border-b border-slate-200 no-print">
+                <th className="pb-2 px-2">
+                  <ColTextFilter value={filters.num} onChange={(v) => setFilters({ ...filters, num: v })} placeholder="№" />
                 </th>
-                <th className="pb-2 px-1.5">
-                  <ColTextFilter value={filters.projNum} onChange={(v) => setFilters({ ...filters, projNum: v })} placeholder="№..." />
+                <th className="pb-2 px-2">
+                  <ColTextFilter value={filters.name} onChange={(v) => setFilters({ ...filters, name: v })} />
                 </th>
-                <th className="pb-2 px-1.5">
+                <th className="pb-2 px-2">
                   <ColTextFilter value={filters.stage} onChange={(v) => setFilters({ ...filters, stage: v })} />
                 </th>
-                <th className="pb-2 px-1.5">
+                <th className="pb-2 px-2">
+                  <ColTextFilter value={filters.deadline} onChange={(v) => setFilters({ ...filters, deadline: v })} placeholder="ДД/ММ/ГГГГ" />
+                </th>
+                <th className="pb-2 px-2">
                   <ColTextFilter value={filters.done} onChange={(v) => setFilters({ ...filters, done: v })} />
                 </th>
-                <th className="pb-2 px-1.5">
+                <th className="pb-2 px-2">
                   <ColTextFilter value={filters.inProgress} onChange={(v) => setFilters({ ...filters, inProgress: v })} />
                 </th>
-                <th className="pb-2 px-1.5">
+                <th className="pb-2 px-2">
                   <ColTextFilter value={filters.blockers} onChange={(v) => setFilters({ ...filters, blockers: v })} />
                 </th>
-                <th className="pb-2 px-1.5">
-                  <ColTextFilter value={filters.dateTasks} onChange={(v) => setFilters({ ...filters, dateTasks: v })} placeholder="ДД/ММ/ГГГГ" />
-                </th>
-                <th className="pb-2 px-1.5">
-                  <ColTextFilter value={filters.dateTotal} onChange={(v) => setFilters({ ...filters, dateTotal: v })} placeholder="ДД/ММ/ГГГГ" />
-                </th>
-                <th className="pb-2 px-1.5"></th>
+                <th className="pb-2 px-2"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filtered.length === 0 ? (
+              {weekReports.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="py-12 text-center text-slate-400">
-                    Записей пока нет. Нажмите «Сформировать по проектам», чтобы подтянуть данные из карточек проектов.
+                  <td colSpan={8} className="py-12 text-center text-slate-400">
+                    За выбранную неделю ({selectedWeek}) записей пока нет. Нажмите «Заполнить из проектов».
                   </td>
                 </tr>
               ) : (
-                filtered.map((r: any, idx: number) => (
-                  <tr key={r.id} className="group hover:bg-slate-50/70 align-top">
-                    <td className="p-2.5 text-center text-xs text-slate-400">{idx + 1}</td>
-                    <td className="p-2">
-                      <input
-                        type="week"
-                        className="w-full px-1.5 py-1 text-xs bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
-                        value={r.week}
-                        onChange={(e) => updateItem(r.id, 'week', e.target.value)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <input
-                        placeholder="№..."
-                        className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
-                        value={r.projNum}
-                        onChange={(e) => updateItem(r.id, 'projNum', e.target.value)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={r.stage}
-                        onChange={(val) => updateItem(r.id, 'stage', val)}
-                        placeholder="Стадия..."
-                        className="text-xs font-medium text-slate-700"
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={r.done}
-                        onChange={(val) => updateItem(r.id, 'done', val)}
-                        placeholder="Выполнено..."
-                        className="text-xs text-slate-700"
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={r.inProgress}
-                        onChange={(val) => updateItem(r.id, 'inProgress', val)}
-                        placeholder="В работе..."
-                        className="text-xs text-slate-700"
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={r.blockers}
-                        onChange={(val) => updateItem(r.id, 'blockers', val)}
-                        placeholder="Блокеры..."
-                        className="text-xs text-rose-700 font-medium"
-                      />
-                    </td>
-                    <td className="p-2">
-                      <DateInput
-                        value={r.dateTasks}
-                        onChange={(val) => updateItem(r.id, 'dateTasks', val)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <DateInput
-                        value={r.dateTotal}
-                        onChange={(val) => updateItem(r.id, 'dateTotal', val)}
-                      />
-                    </td>
-                    <td className="p-2 text-center print-hidden">
-                      <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                weekReports.map((r: any) => {
+                  const realIndex = reports.findIndex((item: any) => item.id === r.id);
+                  const updateRow = (field: string, val: string) => {
+                    const updated = [...reports];
+                    updated[realIndex][field] = val;
+                    setReports(updated);
+                  };
+                  return (
+                    <tr key={r.id} className="group hover:bg-slate-50/70 align-top">
+                      <td className="p-2">
+                        <input
+                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
+                          value={r.num}
+                          onChange={(e) => updateRow('num', e.target.value)}
+                          placeholder="№..."
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={r.name}
+                          onChange={(val) => updateRow('name', val)}
+                          placeholder="Название..."
+                        />
+                      </td>
+                      <td className="p-2">
+                        <input
+                          className="w-full px-2 py-1 text-xs font-medium text-slate-700 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
+                          value={r.stage || ''}
+                          onChange={(e) => updateRow('stage', e.target.value)}
+                          placeholder="Стадия..."
+                        />
+                      </td>
+                      <td className="p-2">
+                        <DateInput
+                          value={r.deadline || ''}
+                          onChange={(val) => updateRow('deadline', val)}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={r.done}
+                          onChange={(val) => updateRow('done', val)}
+                          placeholder="Что закрыто..."
+                          className="text-emerald-800"
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={r.inProgress}
+                          onChange={(val) => updateRow('inProgress', val)}
+                          placeholder="Текущие задачи..."
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={r.blockers}
+                          onChange={(val) => updateRow('blockers', val)}
+                          placeholder="Задержки / вопросы..."
+                          className="text-rose-700"
+                        />
+                      </td>
+                      <td className="p-2 text-center no-print">
                         <button
-                          onClick={() => refreshSingleRow(r)}
-                          className="text-slate-400 hover:text-indigo-600 p-1 rounded"
-                          title="Обновить строку из статуса проекта"
-                        >
-                          <RefreshCw size={14} />
-                        </button>
-                        <button
-                          onClick={() => setReports(reports.filter((rep: any) => rep.id !== r.id))}
-                          className="text-slate-400 hover:text-rose-500 p-1 rounded"
-                          title="Удалить строку"
+                          onClick={() => setReports(reports.filter((item: any) => item.id !== r.id))}
+                          className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
                           <Trash2 size={14} />
                         </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -5335,12 +6320,17 @@ function TabReports({ reports, setReports, projects, onSyncAllProjects }: any) {
   );
 }
 
-// === 11. ВКЛАДКА 4: БЫСТРЫЕ ЗАДАЧИ ===
+// === 13. ВКЛАДКА 4: БЫСТРЫЕ ЗАДАЧИ ===
 
-function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilter }: any) {
+function TabTasks({
+  tasks,
+  setTasks,
+  externalProjectFilter,
+  onClearExternalFilter,
+}: any) {
   const [filters, setFilters] = useState({
-    date: '',
     project: '',
+    date: '',
     desc: '',
     estDate: '',
     status: '',
@@ -5356,12 +6346,12 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
 
   const hasActiveFilters = Object.values(filters).some(Boolean);
   const resetFilters = () =>
-    setFilters({ date: '', project: '', desc: '', estDate: '', status: '', comment: '' });
+    setFilters({ project: '', date: '', desc: '', estDate: '', status: '', comment: '' });
 
   const filtered = tasks.filter((t: any) => {
     return (
-      matchDateFilter(t.date, filters.date) &&
       (!filters.project || (t.project || '').toLowerCase().includes(filters.project.toLowerCase())) &&
+      matchDateFilter(t.date, filters.date) &&
       (!filters.desc || (t.desc || '').toLowerCase().includes(filters.desc.toLowerCase())) &&
       matchDateFilter(t.estDate, filters.estDate) &&
       matchStatusFilter(t.status, filters.status) &&
@@ -5369,18 +6359,16 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
     );
   });
 
-  const updateItem = (id: any, field: string, value: any) => {
-    setTasks(tasks.map((t: any) => (t.id === id ? { ...t, [field]: value } : t)));
-  };
-
   return (
     <div className="space-y-4">
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
+      <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
         <div>
-          <h2 className="text-lg font-semibold text-slate-800">Оперативные и быстрые задачи</h2>
-          <p className="text-xs text-slate-500">Фильтрация по проекту, срокам (ДД/ММ/ГГГГ), статусам и комментариям</p>
+          <h2 className="text-lg font-semibold text-slate-800">Оперативные задачи</h2>
+          <p className="text-xs text-slate-500">
+            Просроченные дедлайны задач автоматически подсвечиваются красным
+          </p>
         </div>
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           {hasActiveFilters && (
             <button
               onClick={resetFilters}
@@ -5394,8 +6382,8 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
               setTasks([
                 {
                   id: Date.now(),
-                  date: getTodayDMY(),
                   project: filters.project || '',
+                  date: getTodayDMY(),
                   desc: '',
                   estDate: '',
                   status: 'в работе',
@@ -5404,7 +6392,7 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
                 ...tasks,
               ])
             }
-            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 shadow-sm transition-colors whitespace-nowrap"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 shadow-sm whitespace-nowrap"
           >
             <Plus size={16} /> Новая задача
           </button>
@@ -5416,20 +6404,20 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
           <table className="w-full text-left border-collapse text-sm">
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                <th className="pt-3 pb-1.5 px-3 w-36">Создано</th>
                 <th className="pt-3 pb-1.5 px-3 w-28">Проект</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Дата постановки</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[260px]">Описание задачи</th>
                 <th className="pt-3 pb-1.5 px-3 w-36">Дедлайн</th>
                 <th className="pt-3 pb-1.5 px-3 w-44">Статус</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[180px]">Комментарий</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Комментарий</th>
                 <th className="pt-3 pb-1.5 px-2 w-10"></th>
               </tr>
               <tr className="bg-slate-50/40 border-b border-slate-200">
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.date} onChange={(v) => setFilters({ ...filters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                  <ColTextFilter value={filters.project} onChange={(v) => setFilters({ ...filters, project: v })} placeholder="№..." />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.project} onChange={(v) => setFilters({ ...filters, project: v })} placeholder="№..." />
+                  <ColTextFilter value={filters.date} onChange={(v) => setFilters({ ...filters, date: v })} placeholder="ДД/ММ/ГГГГ" />
                 </th>
                 <th className="pb-2.5 px-2">
                   <ColTextFilter value={filters.desc} onChange={(v) => setFilters({ ...filters, desc: v })} />
@@ -5458,60 +6446,85 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
                   </td>
                 </tr>
               ) : (
-                filtered.map((t: any) => (
-                  <tr key={t.id} className="group hover:bg-slate-50/70 align-top">
-                    <td className="p-2">
-                      <DateInput
-                        value={t.date}
-                        onChange={(val) => updateItem(t.id, 'date', val)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <input
-                        placeholder="№..."
-                        className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100/70 rounded focus:bg-white focus:outline-none"
-                        value={t.project}
-                        onChange={(e) => updateItem(t.id, 'project', e.target.value)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={t.desc}
-                        onChange={(val) => updateItem(t.id, 'desc', val)}
-                        placeholder="Что нужно сделать..."
-                      />
-                    </td>
-                    <td className="p-2">
-                      <DateInput
-                        value={t.estDate}
-                        onChange={(val) => updateItem(t.id, 'estDate', val)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <StatusPill
-                        value={t.status}
-                        options={['в работе', 'выполнена', 'на паузе', 'передано']}
-                        onChange={(val) => updateItem(t.id, 'status', val)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={t.comment}
-                        onChange={(val) => updateItem(t.id, 'comment', val)}
-                        placeholder="Примечание..."
-                        className="text-xs text-slate-600"
-                      />
-                    </td>
-                    <td className="p-2 text-center">
-                      <button
-                        onClick={() => setTasks(tasks.filter((task: any) => task.id !== t.id))}
-                        className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <Trash2 size={15} />
-                      </button>
-                    </td>
-                  </tr>
-                ))
+                filtered.map((t: any) => {
+                  const updateTask = (field: string, val: string) => {
+                    setTasks(tasks.map((item: any) => (item.id === t.id ? { ...item, [field]: val } : item)));
+                  };
+                  const isCompleted = ['выполнена', 'выполнено'].includes((t.status || '').toLowerCase());
+                  const urgency = !isCompleted ? getDeadlineUrgency(t.estDate) : null;
+
+                  return (
+                    <tr
+                      key={t.id}
+                      className={`group align-top transition-colors ${
+                        urgency === 'overdue'
+                          ? 'bg-rose-50/70 hover:bg-rose-100/60'
+                          : urgency === 'soon'
+                          ? 'bg-amber-50/50 hover:bg-amber-100/50'
+                          : 'hover:bg-slate-50/70'
+                      }`}
+                    >
+                      <td className="p-2">
+                        <input
+                          placeholder="№..."
+                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
+                          value={t.project}
+                          onChange={(e) => updateTask('project', e.target.value)}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <DateInput
+                          value={t.date}
+                          onChange={(val) => updateTask('date', val)}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={t.desc}
+                          onChange={(val) => updateTask('desc', val)}
+                          placeholder="Что нужно сделать..."
+                          className={isCompleted ? 'line-through text-slate-400' : ''}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <DateInput
+                          value={t.estDate}
+                          onChange={(val) => updateTask('estDate', val)}
+                          className={
+                            urgency === 'overdue'
+                              ? 'text-rose-700 font-bold'
+                              : urgency === 'soon'
+                              ? 'text-amber-800 font-semibold'
+                              : ''
+                          }
+                        />
+                      </td>
+                      <td className="p-2">
+                        <StatusPill
+                          value={t.status}
+                          options={['в работе', 'выполнена', 'на паузе', 'передано']}
+                          onChange={(val) => updateTask('status', val)}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={t.comment}
+                          onChange={(val) => updateTask('comment', val)}
+                          placeholder="Комментарий..."
+                          className="text-xs text-slate-600"
+                        />
+                      </td>
+                      <td className="p-2 text-center">
+                        <button
+                          onClick={() => setTasks(tasks.filter((item: any) => item.id !== t.id))}
+                          className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -5521,239 +6534,387 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
   );
 }
 
-// === 12. ГЛАВНЫЙ КОМПОНЕНТ ===
+// === 14. ГЛАВНОЕ ПРИЛОЖЕНИЕ + СИНХРОНИЗАЦИЯ С GOOGLE DRIVE ===
 
 export default function App() {
   const [activeTab, setActiveTab] = useState(0);
-
-  const [projects, setProjects, pReady] = useIndexedStorage<any[]>('pm_projects', []);
-  const [activeProjectId, setActiveProjectId, apReady] = useIndexedStorage<string | null>('pm_active_project', null);
-  const [meetings, setMeetings, mReady] = useIndexedStorage<any[]>('pm_meetings', []);
-  const [tasks, setTasks, tReady] = useIndexedStorage<any[]>('pm_tasks', []);
-  const [reports, setReports, rReady] = useIndexedStorage<any[]>('pm_reports', []);
-  const [calendarEvents, setCalendarEvents, cReady] = useIndexedStorage<any[]>('pm_calendar_events', []);
-  const [lastBackupTime, setLastBackupTime] = useIndexedStorage<number>('pm_last_backup_ts', Date.now());
-
-  const isStorageReady = pReady && apReady && mReady && tReady && rReady && cReady;
-
-  const [externalProjectFilter, setExternalProjectFilter] = useState<string>('');
-  const [externalProjectSubTab, setExternalProjectSubTab] = useState<
-    'tasks' | 'remarks' | 'revisions' | 'docs' | 'related' | null
-  >(null);
-
-  const [previewImage, setPreviewImage] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
-  const [activeToast, setActiveToast] = useState<{ title: string; body: string } | null>(null);
-  const [notifPermission, setNotifPermission] = useState<string>(() =>
-    typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'
+
+  const [lightboxState, setLightboxState] = useState<{
+    images: string[];
+    initialIndex: number;
+    onSaveEdited?: (idx: number, newUrl: string) => void;
+  } | null>(null);
+
+  const [projects, setProjects, loadedProjects] = useIndexedStorage<any[]>('sup_projects_v2', []);
+  const [activeProjectId, setActiveProjectId] = useIndexedStorage<string | null>('sup_active_id_v2', null);
+  const [meetings, setMeetings, loadedMeetings] = useIndexedStorage<any[]>('sup_meetings_v2', []);
+  const [reports, setReports, loadedReports] = useIndexedStorage<any[]>('sup_reports_v2', []);
+  const [tasks, setTasks, loadedTasks] = useIndexedStorage<any[]>('sup_tasks_v2', []);
+  const [calendarEvents, setCalendarEvents, loadedEvents] = useIndexedStorage<any[]>('sup_calendar_events_v1', []);
+
+  // Состояния Google Drive
+  const [googleToken, setGoogleToken] = useState<string | null>(null);
+  const [cloudFileId, setCloudFileId] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<'disconnected' | 'syncing' | 'synced' | 'error'>('disconnected');
+  const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
+  const [gisReady, setGisReady] = useState(false);
+  const tokenClientRef = useRef<any>(null);
+  const isRemoteApplyingRef = useRef(false);
+
+  const [crossTabProjectFilter, setCrossTabProjectFilter] = useState<string>('');
+  const [crossProjectSubTab, setCrossProjectSubTab] = useState<'tasks' | 'remarks' | 'revisions' | 'docs' | 'related' | null>(null);
+
+  const isAllLoaded = loadedProjects && loadedMeetings && loadedReports && loadedTasks && loadedEvents;
+
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 4000);
+  }, []);
+
+  // Загрузка скрипта Google Identity Services
+  useEffect(() => {
+    const existingScript = document.getElementById('google-gis-script');
+    if (existingScript) {
+      if ((window as any).google?.accounts?.oauth2) {
+        setGisReady(true);
+      }
+      return;
+    }
+    const script = document.createElement('script');
+    script.id = 'google-gis-script';
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => setGisReady(true);
+    document.body.appendChild(script);
+  }, []);
+
+  // Поиск или создание файла в Google Drive
+  const findOrCreateCloudFile = useCallback(async (token: string): Promise<string | null> => {
+    try {
+      const q = encodeURIComponent(`name='${CLOUD_DB_FILENAME}' and trashed=false`);
+      const searchRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&fields=files(id,name,modifiedTime)`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (searchRes.status === 401) {
+        setGoogleToken(null);
+        setSyncStatus('disconnected');
+        return null;
+      }
+      const searchData = await searchRes.json();
+      if (searchData.files && searchData.files.length > 0) {
+        return searchData.files[0].id;
+      }
+
+      // Создаём новый пустой файл в корне Google Drive
+      const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          name: CLOUD_DB_FILENAME,
+          mimeType: 'application/json',
+        }),
+      });
+      const created = await createRes.json();
+      return created.id || null;
+    } catch (err) {
+      console.error('Google Drive find/create error:', err);
+      return null;
+    }
+  }, []);
+
+  // Загрузка данных из Google Drive
+  const pullFromGoogleDrive = useCallback(
+    async (token: string, explicitFileId?: string) => {
+      setSyncStatus('syncing');
+      try {
+        const fileId = explicitFileId || (await findOrCreateCloudFile(token));
+        if (!fileId) {
+          setSyncStatus('error');
+          return;
+        }
+        setCloudFileId(fileId);
+
+        const contentRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        if (contentRes.status === 401) {
+          setGoogleToken(null);
+          setSyncStatus('disconnected');
+          return;
+        }
+
+        const rawText = await contentRes.text();
+        if (rawText && rawText.trim().startsWith('{')) {
+          const parsed = JSON.parse(rawText);
+          isRemoteApplyingRef.current = true;
+          if (Array.isArray(parsed.projects)) setProjects(parsed.projects);
+          if (parsed.activeProjectId !== undefined) setActiveProjectId(parsed.activeProjectId);
+          if (Array.isArray(parsed.meetings)) setMeetings(parsed.meetings);
+          if (Array.isArray(parsed.reports)) setReports(parsed.reports);
+          if (Array.isArray(parsed.tasks)) setTasks(parsed.tasks);
+          if (Array.isArray(parsed.calendarEvents)) setCalendarEvents(parsed.calendarEvents);
+          setTimeout(() => {
+            isRemoteApplyingRef.current = false;
+          }, 400);
+          showToast('Данные загружены из Google Drive');
+        } else {
+          // Файл только что создан — выгружаем текущую локальную базу в облако
+          const payload = JSON.stringify({
+            updatedAt: new Date().toISOString(),
+            projects,
+            activeProjectId,
+            meetings,
+            reports,
+            tasks,
+            calendarEvents,
+          });
+          await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+            method: 'PATCH',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: payload,
+          });
+          showToast('Локальная база загружена на Google Drive');
+        }
+
+        const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        setLastSyncTime(nowStr);
+        setSyncStatus('synced');
+      } catch (err) {
+        console.error('Google Drive pull error:', err);
+        setSyncStatus('error');
+      }
+    },
+    [findOrCreateCloudFile, projects, activeProjectId, meetings, reports, tasks, calendarEvents, setProjects, setActiveProjectId, setMeetings, setReports, setTasks, setCalendarEvents, showToast]
   );
 
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Сохранение данных в Google Drive
+  const pushToGoogleDrive = useCallback(
+    async (token: string, fileId: string) => {
+      setSyncStatus('syncing');
+      try {
+        const payload = JSON.stringify({
+          updatedAt: new Date().toISOString(),
+          projects,
+          activeProjectId,
+          meetings,
+          reports,
+          tasks,
+          calendarEvents,
+        });
 
-  // Горячая клавиша Ctrl+K / Cmd+K для глобального поиска
+        const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+          method: 'PATCH',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: payload,
+        });
+
+        if (res.status === 401) {
+          setGoogleToken(null);
+          setSyncStatus('disconnected');
+          showToast('Сессия Google Drive истекла — нажмите «Подключить Drive» заново');
+          return;
+        }
+
+        if (!res.ok) {
+          setSyncStatus('error');
+          return;
+        }
+
+        const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        setLastSyncTime(nowStr);
+        setSyncStatus('synced');
+      } catch (err) {
+        console.error('Google Drive push error:', err);
+        setSyncStatus('error');
+      }
+    },
+    [projects, activeProjectId, meetings, reports, tasks, calendarEvents, showToast]
+  );
+
+  // Автосохранение с задержкой 2.5 секунды при любых изменениях
   useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
+    if (!googleToken || !cloudFileId || !isAllLoaded || isRemoteApplyingRef.current) return;
+    const timer = setTimeout(() => {
+      pushToGoogleDrive(googleToken, cloudFileId);
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [projects, activeProjectId, meetings, reports, tasks, calendarEvents, googleToken, cloudFileId, isAllLoaded, pushToGoogleDrive]);
+
+  const handleConnectGoogleDrive = () => {
+    if (!gisReady || !(window as any).google?.accounts?.oauth2) {
+      showToast('Библиотека Google ещё загружается, попробуйте через 2 секунды');
+      return;
+    }
+    if (!tokenClientRef.current) {
+      tokenClientRef.current = (window as any).google.accounts.oauth2.initTokenClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: GOOGLE_DRIVE_SCOPE,
+        callback: (resp: any) => {
+          if (resp.error) {
+            showToast(`Ошибка входа Google: ${resp.error}`);
+            setSyncStatus('error');
+            return;
+          }
+          if (resp.access_token) {
+            setGoogleToken(resp.access_token);
+            pullFromGoogleDrive(resp.access_token);
+          }
+        },
+      });
+    }
+    tokenClientRef.current.requestAccessToken({ prompt: '' });
+  };
+
+  const handleDisconnectGoogleDrive = () => {
+    setGoogleToken(null);
+    setCloudFileId(null);
+    setSyncStatus('disconnected');
+    showToast('Google Drive отключён. Данные продолжают сохраняться локально.');
+  };
+
+  // Горячие клавиши Ctrl+K / Cmd+K для глобального поиска
+  useEffect(() => {
+    const handleGlobalKey = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setIsSearchOpen((prev) => !prev);
-      } else if (e.key === 'Escape') {
+      } else if (e.key === 'Escape' && isSearchOpen) {
         setIsSearchOpen(false);
       }
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+    window.addEventListener('keydown', handleGlobalKey);
+    return () => window.removeEventListener('keydown', handleGlobalKey);
+  }, [isSearchOpen]);
 
-  // Таймер проверки запланированных напоминаний каждую минуту
+  // Фоновая проверка времени напоминаний
   useEffect(() => {
-    if (!isStorageReady) return;
-
+    if (!isAllLoaded) return;
     const checkReminders = () => {
-      const now = new Date();
       const todayStr = getTodayDMY();
-      const hh = String(now.getHours()).padStart(2, '0');
-      const mm = String(now.getMinutes()).padStart(2, '0');
-      const currentHHMM = `${hh}:${mm}`;
+      const now = new Date();
+      const currentHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
-      let triggeredEvent: any = null;
-
-      const updatedEvents = calendarEvents.map((ev: any) => {
-        if (!ev.notified && formatToDMY(ev.date) === todayStr && ev.time === currentHHMM) {
-          triggeredEvent = ev;
+      let triggeredTitle: string | null = null;
+      const updated = calendarEvents.map((ev: any) => {
+        if (
+          !ev.notified &&
+          formatToDMY(ev.date) === todayStr &&
+          ev.time &&
+          ev.time <= currentHHMM
+        ) {
+          triggeredTitle = `${ev.time} — ${ev.projectNum ? `#${ev.projectNum}: ` : ''}${ev.title}`;
           return { ...ev, notified: true };
         }
         return ev;
       });
 
-      if (triggeredEvent) {
-        setCalendarEvents(updatedEvents);
-        const title = `Напоминание SUP${triggeredEvent.projectNum ? ` (#${triggeredEvent.projectNum})` : ''}`;
-        const body = `${triggeredEvent.time} — ${triggeredEvent.title}`;
-
+      if (triggeredTitle) {
+        setCalendarEvents(updated);
         playNotificationChime();
-        setActiveToast({ title, body });
-
-        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-          try {
-            new Notification(title, { body });
-          } catch {
-            // ignore notification errors
-          }
+        showToast(`🔔 Напоминание: ${triggeredTitle}`);
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('SUP Project Tracker', { body: triggeredTitle });
         }
       }
     };
 
     checkReminders();
-    const timer = setInterval(checkReminders, 15000);
+    const timer = setInterval(checkReminders, 30000);
     return () => clearInterval(timer);
-  }, [calendarEvents, isStorageReady, setCalendarEvents]);
+  }, [calendarEvents, isAllLoaded, setCalendarEvents, showToast]);
 
-  const handleRequestNotifications = async () => {
-    if (typeof Notification === 'undefined') {
-      alert('Ваш браузер не поддерживает системные уведомления.');
-      return;
-    }
-    const perm = await Notification.requestPermission();
-    setNotifPermission(perm);
-    if (perm === 'granted') {
-      playNotificationChime();
-      setActiveToast({
-        title: 'Уведомления включены',
-        body: 'Вы получите звуковой сигнал и системное окно при наступлении времени в календаре.',
-      });
-    }
+  const handleNavigateWithFilter = (tabIndex: number, projectNum: string) => {
+    setCrossTabProjectFilter(projectNum);
+    setActiveTab(tabIndex);
   };
 
-  const handleOpenProjectFromOverview = (
+  const handleOpenProject = (
     projectId: string,
-    subTab?: 'tasks' | 'remarks' | 'revisions' | 'docs' | 'related'
+    targetSubTab?: 'tasks' | 'remarks' | 'revisions' | 'docs' | 'related'
   ) => {
     setActiveProjectId(projectId);
-    if (subTab) {
-      setExternalProjectSubTab(subTab);
+    if (targetSubTab) {
+      setCrossProjectSubTab(targetSubTab);
     }
     setActiveTab(2);
   };
 
-  const handleNavigateWithFilter = (tabIndex: number, projectNum: string) => {
-    setExternalProjectFilter(projectNum);
-    setActiveTab(tabIndex);
-  };
-
-  const handleSyncSingleProjectToReport = (project: any, targetWeek = getCurrentISOWeek()) => {
-    const summary = buildProjectReportSummary(project, targetWeek);
+  const handleSyncSingleProjectToReport = (project: any) => {
+    const currentWeek = getCurrentISOWeek();
+    const summary = buildProjectReportSummary(project, currentWeek);
     const existingIdx = reports.findIndex(
-      (r: any) =>
-        (r.week || '').trim() === targetWeek &&
-        (r.projNum || '').trim() === (project.num || '').trim()
+      (r: any) => r.week === currentWeek && (r.num || '').trim() === (project.num || '').trim()
     );
 
-    if (existingIdx !== -1) {
+    if (existingIdx >= 0) {
       const updated = [...reports];
       updated[existingIdx] = {
         ...updated[existingIdx],
+        name: project.name || updated[existingIdx].name,
         stage: summary.stage || updated[existingIdx].stage,
+        deadline: summary.deadline || updated[existingIdx].deadline,
         done: summary.done,
         inProgress: summary.inProgress,
         blockers: summary.blockers,
-        dateTotal: summary.deadline || updated[existingIdx].dateTotal,
       };
       setReports(updated);
     } else {
       setReports([
+        ...reports,
         {
           id: Date.now(),
-          week: targetWeek,
-          projNum: project.num,
+          week: currentWeek,
+          num: project.num,
+          name: project.name || '',
           stage: summary.stage,
+          deadline: summary.deadline,
           done: summary.done,
           inProgress: summary.inProgress,
           blockers: summary.blockers,
-          dateTasks: '',
-          dateTotal: summary.deadline,
         },
-        ...reports,
       ]);
     }
-    setActiveTab(3);
-  };
-
-  const handleSyncAllProjectsToReport = (targetWeek: string) => {
-    if (!projects.length) {
-      alert('Нет активных проектов во вкладке «Статус проекта».');
-      return;
-    }
-
-    let nextReports = [...reports];
-
-    projects.forEach((proj: any, idx: number) => {
-      const summary = buildProjectReportSummary(proj, targetWeek);
-      const existingIdx = nextReports.findIndex(
-        (r: any) =>
-          (r.week || '').trim() === targetWeek &&
-          (r.projNum || '').trim() === (proj.num || '').trim()
-      );
-
-      if (existingIdx !== -1) {
-        nextReports[existingIdx] = {
-          ...nextReports[existingIdx],
-          stage: summary.stage || nextReports[existingIdx].stage,
-          done: summary.done,
-          inProgress: summary.inProgress,
-          blockers: summary.blockers,
-          dateTotal: summary.deadline || nextReports[existingIdx].dateTotal,
-        };
-      } else {
-        nextReports.unshift({
-          id: Date.now() + idx + 1,
-          week: targetWeek,
-          projNum: proj.num,
-          stage: summary.stage,
-          done: summary.done,
-          inProgress: summary.inProgress,
-          blockers: summary.blockers,
-          dateTasks: '',
-          dateTotal: summary.deadline,
-        });
-      }
-    });
-
-    setReports(nextReports);
+    showToast(`Отчет по проекту #${project.num} за неделю ${currentWeek} обновлен!`);
   };
 
   const handleBackup = () => {
-    const data = {
-      projects,
-      activeProjectId,
-      meetings,
-      tasks,
-      reports,
-      calendarEvents,
-      exportedAt: new Date().toISOString(),
-    };
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const data = JSON.stringify({ projects, activeProjectId, meetings, reports, tasks, calendarEvents }, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `SUP_Backup_${getTodayDMY().replace(/\//g, '-')}.json`;
+    link.download = `SUP_Database_${new Date().toISOString().split('T')[0]}.json`;
     link.click();
-    setLastBackupTime(Date.now());
+    showToast('Резервная копия сохранена на компьютер!');
   };
 
-  const handleRestore = (e: any) => {
+  const handleRestore = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (ev: any) => {
       try {
-        const data = JSON.parse(ev.target.result);
-        if (data.projects) setProjects(data.projects);
-        if (data.activeProjectId !== undefined) setActiveProjectId(data.activeProjectId);
-        if (data.meetings) setMeetings(data.meetings);
-        if (data.tasks) setTasks(data.tasks);
-        if (data.reports) setReports(data.reports);
-        if (data.calendarEvents) setCalendarEvents(data.calendarEvents);
-        setLastBackupTime(Date.now());
-        alert('База проектов успешно восстановлена в IndexedDB!');
+        const parsed = JSON.parse(ev.target.result);
+        if (parsed.projects) setProjects(parsed.projects);
+        if (parsed.activeProjectId !== undefined) setActiveProjectId(parsed.activeProjectId);
+        if (parsed.meetings) setMeetings(parsed.meetings);
+        if (parsed.reports) setReports(parsed.reports);
+        if (parsed.tasks) setTasks(parsed.tasks);
+        if (parsed.calendarEvents) setCalendarEvents(parsed.calendarEvents);
+        showToast('База данных успешно восстановлена из файла!');
       } catch {
         alert('Ошибка при чтении файла резервной копии.');
       }
@@ -5762,169 +6923,195 @@ export default function App() {
     e.target.value = '';
   };
 
-  const isBackupOverdue = Date.now() - lastBackupTime > 7 * 24 * 60 * 60 * 1000;
+  const activeBlockersTotal = projects.reduce(
+    (acc: number, p: any) => acc + (p.blockers || []).filter((b: any) => !b.resolved).length,
+    0
+  );
+  const openTasksTotal = tasks.filter(
+    (t: any) => !['выполнена', 'выполнено'].includes((t.status || '').toLowerCase())
+  ).length;
+  const openMeetingsTotal = meetings.filter(
+    (m: any) => (m.status || '').toLowerCase() !== 'исправлено'
+  ).length;
 
   const tabs = [
-    { id: 0, label: 'Сводка и Календарь', icon: CalendarDays, count: calendarEvents.length },
-    { id: 1, label: 'Встречи', icon: Users, count: meetings.length },
-    { id: 2, label: 'Статус проекта', icon: FolderKanban, count: projects.length },
-    { id: 3, label: 'Еженедельный отчет', icon: FileSpreadsheet, count: reports.length },
-    { id: 4, label: 'Быстрые задачи', icon: CheckSquare, count: tasks.length },
+    { id: 0, title: 'Сводка и Календарь', icon: CalendarDays, badge: 0 },
+    { id: 1, title: 'Встречи', icon: Users, badge: openMeetingsTotal },
+    { id: 2, title: 'Статус проекта', icon: FolderKanban, badge: activeBlockersTotal },
+    { id: 3, title: 'Еженедельный отчет', icon: FileSpreadsheet, badge: 0 },
+    { id: 4, title: 'Задачи', icon: CheckSquare, badge: openTasksTotal },
   ];
 
-  if (!isStorageReady) {
+  const requestDesktopNotifications = () => {
+    if (!('Notification' in window)) {
+      showToast('Ваш браузер не поддерживает системные уведомления');
+      return;
+    }
+    Notification.requestPermission().then((perm) => {
+      if (perm === 'granted') {
+        showToast('Уведомления в браузере включены!');
+      } else {
+        showToast('Доступ к уведомлениям отклонен в настройках браузера');
+      }
+    });
+  };
+
+  if (!isAllLoaded) {
     return (
-      <div className="min-h-screen bg-slate-50 flex items-center justify-center text-sm text-slate-500 gap-2">
-        <Database size={18} className="animate-pulse text-indigo-600" />
-        Загрузка базы проектов SUP...
+      <div className="min-h-screen bg-slate-100/70 flex items-center justify-center text-slate-500 text-sm">
+        Загрузка базы данных SUP...
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#f8fafc] text-slate-800 flex flex-col font-sans">
+    <div className="min-h-screen bg-slate-100/70 text-slate-800 font-sans pb-16">
       <style>{`
         @media print {
-          body * { visibility: hidden; }
-          .print-area, .print-area * { visibility: visible; }
-          .print-area { position: absolute; left: 0; top: 0; width: 100%; background: white; }
-          .print-hidden { display: none !important; }
-          input, textarea, select { border: none !important; background: transparent !important; appearance: none !important; }
+          .no-print { display: none !important; }
+          body { background: white !important; }
+          table { font-size: 11px !important; }
+          textarea { border: none !important; resize: none !important; }
         }
       `}</style>
 
-      {/* Всплывающее окно напоминания */}
-      {activeToast && (
-        <div className="fixed bottom-5 right-5 z-50 max-w-sm bg-slate-900 text-white p-4 rounded-2xl shadow-2xl border border-indigo-400/40 flex items-start gap-3 animate-bounce">
-          <BellRing size={20} className="text-amber-400 shrink-0 mt-0.5" />
-          <div className="flex-grow min-w-0">
-            <div className="text-xs font-bold text-amber-300">{activeToast.title}</div>
-            <div className="text-xs text-slate-100 mt-1 leading-relaxed">{activeToast.body}</div>
-          </div>
-          <button
-            onClick={() => setActiveToast(null)}
-            className="text-slate-400 hover:text-white p-0.5"
-          >
-            <X size={15} />
-          </button>
-        </div>
-      )}
-
-      {/* Глобальный поиск Ctrl+K */}
       {isSearchOpen && (
         <GlobalSearchModal
           projects={projects}
           meetings={meetings}
           tasks={tasks}
           onClose={() => setIsSearchOpen(false)}
-          onSelectProject={(projectId, subTab) => handleOpenProjectFromOverview(projectId, subTab)}
+          onSelectProject={handleOpenProject}
           onNavigateTab={(tabId, filterNum) => handleNavigateWithFilter(tabId, filterNum || '')}
         />
       )}
 
-      {/* Лайтбокс для скриншотов */}
-      {previewImage && (
-        <div
-          onClick={() => setPreviewImage(null)}
-          className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-xs flex items-center justify-center p-4 cursor-zoom-out"
-        >
-          <div className="relative max-w-5xl max-h-[90vh]">
-            <img src={previewImage} alt="Увеличенный скриншот" className="max-h-[88vh] rounded-xl shadow-2xl" />
-            <button
-              onClick={() => setPreviewImage(null)}
-              className="absolute -top-3 -right-3 bg-white text-slate-800 rounded-full p-1.5 shadow-lg hover:bg-rose-50 hover:text-rose-600"
-            >
-              <X size={18} />
-            </button>
-          </div>
+      {lightboxState && (
+        <ScreenshotLightboxModal
+          images={lightboxState.images}
+          initialIndex={lightboxState.initialIndex}
+          onClose={() => setLightboxState(null)}
+          onSaveEditedImage={lightboxState.onSaveEdited}
+        />
+      )}
+
+      {toastMessage && (
+        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg text-xs font-medium flex items-center gap-2 border border-slate-700">
+          <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+          <span>{toastMessage}</span>
         </div>
       )}
 
-      <header className="bg-white border-b border-slate-200/90 sticky top-0 z-30 print-hidden">
+      <header className="bg-white border-b border-slate-200/80 sticky top-0 z-30 no-print shadow-2xs">
         <div className="max-w-[1440px] mx-auto px-4 sm:px-6">
-          <div className="h-16 flex items-center justify-between gap-4">
+          <div className="flex flex-wrap justify-between items-center py-3 gap-3">
             <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white font-bold flex items-center justify-center shadow-sm tracking-tight">
+              <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-base shadow-sm">
                 SUP
               </div>
               <div>
-                <h1 className="font-bold text-slate-900 text-base leading-tight">
-                  Управление проектами
+                <h1 className="text-base font-bold text-slate-900 leading-tight">
+                  SUP Engineering — Трекер проектов
                 </h1>
                 <p className="text-[11px] text-slate-400">
-                  Инженерный трекер объектов • IndexedDB
+                  Водоснабжение, канализация и пожаротушение
                 </p>
               </div>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={() => setIsSearchOpen(true)}
-                className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200/80 border border-slate-200/90 rounded-lg transition-colors"
-                title="Быстрый поиск по всем проектам и задачам (Ctrl+K)"
+                className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200/70 text-slate-600 px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-200/80 transition-colors"
+                title="Глобальный поиск по всем разделам (Ctrl+K)"
               >
-                <Search size={14} className="text-slate-500" />
-                <span className="hidden md:inline">Поиск</span>
-                <kbd className="hidden sm:inline text-[10px] px-1.5 py-0.5 bg-white rounded border border-slate-200 text-slate-400">
+                <Search size={14} className="text-indigo-600" />
+                <span className="hidden md:inline">Поиск...</span>
+                <kbd className="text-[10px] font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200 text-slate-400">
                   Ctrl+K
                 </kbd>
               </button>
 
+              {/* Статус Google Drive */}
+              {!googleToken ? (
+                <button
+                  type="button"
+                  onClick={handleConnectGoogleDrive}
+                  className="flex items-center gap-1.5 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors"
+                  title="Подключить Google Drive для автоматического сохранения базы в облако"
+                >
+                  <Cloud size={14} /> Подключить Drive
+                </button>
+              ) : (
+                <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 text-emerald-800 px-2.5 py-1.5 rounded-lg text-xs font-medium">
+                  {syncStatus === 'syncing' ? (
+                    <>
+                      <Loader2 size={13} className="animate-spin text-emerald-600" />
+                      <span>Сохранение...</span>
+                    </>
+                  ) : syncStatus === 'error' ? (
+                    <>
+                      <CloudOff size={13} className="text-rose-600" />
+                      <span className="text-rose-700">Ошибка Drive</span>
+                    </>
+                  ) : (
+                    <>
+                      <Cloud size={13} className="text-emerald-600" />
+                      <span>Drive{lastSyncTime ? `: ${lastSyncTime}` : ' ✓'}</span>
+                    </>
+                  )}
+                  {cloudFileId && (
+                    <button
+                      type="button"
+                      onClick={() => pushToGoogleDrive(googleToken, cloudFileId)}
+                      className="ml-1 p-0.5 text-emerald-600 hover:text-emerald-900 rounded"
+                      title="Синхронизировать с Google Drive сейчас"
+                    >
+                      <RefreshCw size={12} />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleDisconnectGoogleDrive}
+                    className="ml-0.5 p-0.5 text-slate-400 hover:text-rose-600 rounded"
+                    title="Отключить Google Drive"
+                  >
+                    <LogOut size={12} />
+                  </button>
+                </div>
+              )}
+
               <button
                 type="button"
-                onClick={handleRequestNotifications}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
-                  notifPermission === 'granted'
-                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                    : 'bg-white hover:bg-slate-50 text-slate-700 border-slate-200'
-                }`}
-                title={
-                  notifPermission === 'granted'
-                    ? 'Системные уведомления активны'
-                    : 'Включить уведомления о событиях календаря'
-                }
+                onClick={requestDesktopNotifications}
+                className="p-1.5 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 border border-slate-200/80 transition-colors"
+                title="Включить всплывающие уведомления о событиях календаря"
               >
-                {notifPermission === 'granted' ? <BellRing size={14} /> : <Bell size={14} />}
-                <span className="hidden lg:inline">
-                  {notifPermission === 'granted' ? 'Уведомления вкл.' : 'Уведомления'}
-                </span>
+                <Bell size={15} />
               </button>
+
+              <span
+                className="hidden xl:inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 bg-slate-100 border border-slate-200/80 px-2.5 py-1.5 rounded-lg"
+                title="Данные всегда дублируются локально в браузере (IndexedDB)"
+              >
+                <Database size={12} /> IndexedDB
+              </span>
 
               <button
                 onClick={handleBackup}
-                className="relative flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200/80 rounded-lg transition-colors"
-                title={
-                  isBackupOverdue
-                    ? 'Рекомендуется сохранить резервную копию (прошло более 7 дней)'
-                    : 'Скачать резервную копию всех данных (JSON)'
-                }
+                className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200/70 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                title="Скачать полную базу данных с изображениями на компьютер"
               >
-                <Save size={14} className="text-indigo-600" />
-                <span className="hidden sm:inline">Сохранить базу</span>
-                {isBackupOverdue && (
-                  <span
-                    className="w-2 h-2 rounded-full bg-amber-500 absolute -top-0.5 -right-0.5"
-                    title="Давно не делали бэкап"
-                  />
-                )}
+                <Save size={14} /> Бэкап
               </button>
-
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200/80 rounded-lg transition-colors"
-                title="Загрузить базу из файла (JSON)"
+              <label
+                className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200/70 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-colors"
+                title="Восстановить базу из JSON-файла с компьютера"
               >
-                <Upload size={14} className="text-emerald-600" />
-                <span className="hidden sm:inline">Загрузить</span>
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".json"
-                onChange={handleRestore}
-                className="hidden"
-              />
+                <Upload size={14} /> Восстановить
+                <input type="file" accept=".json" onChange={handleRestore} className="hidden" />
+              </label>
             </div>
           </div>
 
@@ -5936,21 +7123,27 @@ export default function App() {
                 <button
                   key={tab.id}
                   onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-all whitespace-nowrap ${
+                  className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-all whitespace-nowrap ${
                     isActive
                       ? 'border-indigo-600 text-indigo-600'
                       : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'
                   }`}
                 >
                   <Icon size={16} />
-                  {tab.label}
-                  <span
-                    className={`px-2 py-0.5 text-[11px] rounded-full font-semibold ${
-                      isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-slate-100 text-slate-500'
-                    }`}
-                  >
-                    {tab.count}
-                  </span>
+                  {tab.title}
+                  {tab.badge > 0 && (
+                    <span
+                      className={`px-1.5 py-0.2 rounded-full text-[11px] font-bold ${
+                        tab.id === 2
+                          ? 'bg-rose-100 text-rose-700'
+                          : isActive
+                          ? 'bg-indigo-100 text-indigo-700'
+                          : 'bg-slate-200/80 text-slate-600'
+                      }`}
+                    >
+                      {tab.badge}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -5958,15 +7151,16 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex-grow max-w-[1440px] w-full mx-auto px-4 sm:px-6 py-6">
+      <main className="max-w-[1440px] mx-auto px-4 sm:px-6 pt-6">
         {activeTab === 0 && (
           <TabOverviewCalendar
             projects={projects}
+            setProjects={setProjects}
             meetings={meetings}
             tasks={tasks}
             calendarEvents={calendarEvents}
             setCalendarEvents={setCalendarEvents}
-            onOpenProject={handleOpenProjectFromOverview}
+            onOpenProject={handleOpenProject}
             onNavigateWithFilter={handleNavigateWithFilter}
           />
         )}
@@ -5974,9 +7168,12 @@ export default function App() {
           <TabMeetings
             meetings={meetings}
             setMeetings={setMeetings}
-            onPreviewImage={setPreviewImage}
-            externalProjectFilter={externalProjectFilter}
-            onClearExternalFilter={() => setExternalProjectFilter('')}
+            projects={projects}
+            onPreviewImages={(images: string[], startIndex: number, onSaveEdited: (idx: number, newUrl: string) => void) =>
+              setLightboxState({ images, initialIndex: startIndex, onSaveEdited })
+            }
+            externalProjectFilter={crossTabProjectFilter}
+            onClearExternalFilter={() => setCrossTabProjectFilter('')}
           />
         )}
         {activeTab === 2 && (
@@ -5990,26 +7187,27 @@ export default function App() {
             tasks={tasks}
             setTasks={setTasks}
             onNavigateWithFilter={handleNavigateWithFilter}
-            onPreviewImage={setPreviewImage}
+            onPreviewImages={(images: string[], startIndex: number, onSaveEdited: (idx: number, newUrl: string) => void) =>
+              setLightboxState({ images, initialIndex: startIndex, onSaveEdited })
+            }
             onSyncSingleProjectToReport={handleSyncSingleProjectToReport}
-            externalSubTab={externalProjectSubTab}
-            onClearExternalSubTab={() => setExternalProjectSubTab(null)}
+            externalSubTab={crossProjectSubTab}
+            onClearExternalSubTab={() => setCrossProjectSubTab(null)}
           />
         )}
         {activeTab === 3 && (
-          <TabReports
+          <TabWeeklyReport
             reports={reports}
             setReports={setReports}
             projects={projects}
-            onSyncAllProjects={handleSyncAllProjectsToReport}
           />
         )}
         {activeTab === 4 && (
           <TabTasks
             tasks={tasks}
             setTasks={setTasks}
-            externalProjectFilter={externalProjectFilter}
-            onClearExternalFilter={() => setExternalProjectFilter('')}
+            externalProjectFilter={crossTabProjectFilter}
+            onClearExternalFilter={() => setCrossTabProjectFilter('')}
           />
         )}
       </main>
