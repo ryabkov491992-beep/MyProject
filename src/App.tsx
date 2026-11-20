@@ -53,6 +53,10 @@ import {
   CloudOff,
   Loader2,
   LogOut,
+  Star,
+  Archive,
+  Building2,
+  AlertTriangle,
 } from 'lucide-react';
 
 // === КОНФИГУРАЦИЯ GOOGLE DRIVE ===
@@ -98,26 +102,14 @@ async function idbSet<T>(key: string, val: T): Promise<void> {
   try {
     const db = await openTrackerDB();
     await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(IDB_STORE, 'writewrite' as any);
+      const tx = db.transaction(IDB_STORE, 'readwrite');
       const store = tx.objectStore(IDB_STORE);
       const req = store.put(val, key);
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
     });
-  } catch (err) {
-    // Fallback на корректный режим транзакции
-    try {
-      const db = await openTrackerDB();
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(IDB_STORE, 'readwrite');
-        const store = tx.objectStore(IDB_STORE);
-        const req = store.put(val, key);
-        req.onsuccess = () => resolve();
-        req.onerror = () => reject(req.error);
-      });
-    } catch (e) {
-      console.error('IndexedDB write error:', e);
-    }
+  } catch (e) {
+    console.error('IndexedDB write error:', e);
   }
 }
 
@@ -288,6 +280,31 @@ const compressImageDataUrl = (dataUrl: string, maxWidth = 1400, quality = 0.85):
   });
 };
 
+const copyImageDataUrlToClipboard = async (dataUrl: string): Promise<boolean> => {
+  try {
+    if (!navigator.clipboard || !(window as any).ClipboardItem) return false;
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject();
+      img.src = dataUrl;
+    });
+    const canvas = document.createElement('canvas');
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+    ctx.drawImage(img, 0, 0);
+    const pngBlob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+    if (!pngBlob) return false;
+    await navigator.clipboard.write([new (window as any).ClipboardItem({ 'image/png': pngBlob })]);
+    return true;
+  } catch (e) {
+    console.error('Clipboard image copy failed:', e);
+    return false;
+  }
+};
+
 const downloadICSFile = (title: string, dateDMY: string, timeHHMM?: string, description?: string) => {
   const iso = formatToISO(dateDMY);
   if (!iso) return;
@@ -316,7 +333,7 @@ const downloadICSFile = (title: string, dateDMY: string, timeHHMM?: string, desc
     'BEGIN:VALARM',
     'TRIGGER:-PT15M',
     'ACTION:DISPLAY',
-    'DESCRIPTION:Напоминание SUP Tracker',
+    'DESCRIPTION:Напоминание ProjectStatus',
     'END:VALARM',
     'END:VEVENT',
     'END:VCALENDAR',
@@ -359,7 +376,9 @@ const buildProjectReportSummary = (project: any, targetWeek: string) => {
   );
   const doneText =
     doneThisWeek.length > 0
-      ? doneThisWeek.map((t: any) => t.name).join(', ')
+      ? doneThisWeek
+          .map((t: any) => `${t.building ? `[${t.building}] ` : ''}${t.name}`)
+          .join(', ')
       : 'На этой неделе ничего не выполнено';
 
   let currentSection = 'Общее';
@@ -367,14 +386,17 @@ const buildProjectReportSummary = (project: any, targetWeek: string) => {
 
   tasksList.forEach((t: any) => {
     if (t.isHeader) {
-      currentSection = t.name.replace('📋 ', '').replace(/^\d+\.\s*/, '').trim();
+      const bldPrefix = t.building ? `[${t.building}] ` : '';
+      currentSection = bldPrefix + t.name.replace('📋 ', '').replace(/^\d+\.\s*/, '').trim();
       return;
     }
     if (t.status === 'в работе' || t.status === 'передано другому') {
       if (!groupedInProgress[currentSection]) {
         groupedInProgress[currentSection] = [];
       }
-      const label = t.status === 'передано другому' ? `${t.name} (передано)` : t.name;
+      const bldTag = t.building && !currentSection.includes(`[${t.building}]`) ? `[${t.building}] ` : '';
+      const label =
+        t.status === 'передано другому' ? `${bldTag}${t.name} (передано)` : `${bldTag}${t.name}`;
       groupedInProgress[currentSection].push(label);
     }
   });
@@ -407,7 +429,7 @@ const matchDateFilter = (itemDate: string, filterVal: string) => {
   return displayDate.includes(normalizedFilter);
 };
 
-// === 3. РЕДАКТОР ПОМЕТОК НА СКРИНШОТАХ (ЛАЙТБОКС) ===
+// === 3. РЕДАКТОР ПОМЕТОК НА СКРИНШОТАХ И КОПИРОВАНИЕ В БУФЕР ===
 
 type DrawShape =
   | { type: 'rect'; color: string; x1: number; y1: number; x2: number; y2: number }
@@ -433,6 +455,7 @@ function ScreenshotLightboxModal({
   const [shapes, setShapes] = useState<DrawShape[]>([]);
   const [draftShape, setDraftShape] = useState<DrawShape | null>(null);
   const [textDraft, setTextDraft] = useState<{ x: number; y: number; value: string } | null>(null);
+  const [copiedImg, setCopiedImg] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const loadedImgRef = useRef<HTMLImageElement | null>(null);
@@ -444,6 +467,7 @@ function ScreenshotLightboxModal({
     setDraftShape(null);
     setTextDraft(null);
     setIsAnnotating(false);
+    setCopiedImg(false);
   }, [currentIndex]);
 
   useEffect(() => {
@@ -592,8 +616,26 @@ function ScreenshotLightboxModal({
     setShapes([]);
   };
 
+  const handleCopyCurrentImage = async () => {
+    const sourceToCopy =
+      isAnnotating && canvasRef.current ? canvasRef.current.toDataURL('image/png') : currentSrc;
+    if (!sourceToCopy) return;
+    const ok = await copyImageDataUrlToClipboard(sourceToCopy);
+    if (ok) {
+      setCopiedImg(true);
+      setTimeout(() => setCopiedImg(false), 2200);
+    } else {
+      alert('Браузер не разрешил копирование картинки в буфер обмена. Попробуйте правой кнопкой -> Копировать изображение.');
+    }
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c' && !textDraft) {
+        e.preventDefault();
+        handleCopyCurrentImage();
+        return;
+      }
       if (e.key === 'Escape') {
         if (textDraft) {
           setTextDraft(null);
@@ -612,7 +654,7 @@ function ScreenshotLightboxModal({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [isAnnotating, textDraft, images.length, onClose]);
+  }, [isAnnotating, textDraft, images.length, onClose, currentSrc]);
 
   return (
     <div
@@ -634,9 +676,22 @@ function ScreenshotLightboxModal({
                   onClick={() => setIsAnnotating(true)}
                   className="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
                 >
-                  <Pencil size={14} /> Пометить на скриншоте (рамка / стрелка / текст)
+                  <Pencil size={14} /> Пометить на скриншоте
                 </button>
               )}
+              <button
+                type="button"
+                onClick={handleCopyCurrentImage}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                  copiedImg
+                    ? 'bg-emerald-600 text-white'
+                    : 'bg-slate-700 hover:bg-slate-600 text-slate-100'
+                }`}
+                title="Скопировать скриншот в буфер обмена для вставки в Outlook или WhatsApp (Ctrl+C)"
+              >
+                {copiedImg ? <Check size={14} /> : <Copy size={14} />}
+                {copiedImg ? 'Скопировано в буфер!' : 'Копировать в буфер (Ctrl+C)'}
+              </button>
               <button
                 type="button"
                 onClick={onClose}
@@ -723,6 +778,18 @@ function ScreenshotLightboxModal({
                 title="Отменить последний элемент"
               >
                 <Undo2 size={13} /> Назад
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCopyCurrentImage}
+                className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 ${
+                  copiedImg ? 'bg-emerald-600 text-white' : 'bg-slate-700 hover:bg-slate-600 text-white'
+                }`}
+                title="Скопировать картинку с пометками сразу в буфер обмена"
+              >
+                {copiedImg ? <Check size={13} /> : <Copy size={13} />}
+                {copiedImg ? 'В буфере!' : 'В буфер'}
               </button>
 
               <button
@@ -1125,6 +1192,7 @@ function ImageCell({
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
   const images = normalizeScreenshots(src);
 
   const handleAddImage = (newImg: string) => {
@@ -1141,11 +1209,11 @@ function ImageCell({
     onChange(next);
   };
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files || []);
-    if (!files.length) return;
+  const processFileList = async (files: File[]) => {
+    const imageFiles = files.filter((f) => f.type && f.type.startsWith('image/'));
+    if (!imageFiles.length) return;
     const compressedList: string[] = [];
-    for (const file of files) {
+    for (const file of imageFiles) {
       const dataUrl = await new Promise<string>((resolve) => {
         const reader = new FileReader();
         reader.onload = (ev: any) => resolve(ev.target.result);
@@ -1155,11 +1223,39 @@ function ImageCell({
       compressedList.push(compressed);
     }
     onChange([...images, ...compressedList]);
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    await processFileList(files);
     e.target.value = '';
   };
 
+  const handleDropFiles = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+    const files = Array.from(e.dataTransfer?.files || []);
+    await processFileList(files);
+  };
+
   return (
-    <div className="flex flex-col items-center gap-1.5">
+    <div
+      onDragOver={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!isDraggingOver) setIsDraggingOver(true);
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDraggingOver(false);
+      }}
+      onDrop={handleDropFiles}
+      className={`flex flex-col items-center gap-1.5 p-1 rounded-lg transition-colors ${
+        isDraggingOver ? 'bg-indigo-100/80 ring-2 ring-indigo-500 border-dashed' : ''
+      }`}
+    >
       {images.length > 0 && (
         <div className="flex flex-wrap items-center justify-center gap-1.5 max-w-[170px]">
           {images.map((imgSrc, idx) => (
@@ -1169,7 +1265,7 @@ function ImageCell({
                 alt={`Скриншот ${idx + 1}`}
                 onClick={() => onPreview(images, idx, handleSaveEditedAt)}
                 className="h-11 w-14 object-cover rounded border border-slate-200 cursor-zoom-in shadow-xs hover:border-indigo-400 transition-colors"
-                title="Нажмите для просмотра и нанесения пометок"
+                title="Нажмите для просмотра, пометок или копирования"
               />
               <button
                 type="button"
@@ -1194,9 +1290,9 @@ function ImageCell({
           onClick={() => boxRef.current?.focus()}
           onPaste={(e) => handlePasteImage(e, handleAddImage)}
           className="text-[10px] text-slate-400 py-1 px-2 border border-dashed border-slate-300 rounded-lg hover:border-indigo-400 hover:text-indigo-600 focus:border-indigo-600 focus:bg-indigo-50/70 focus:text-indigo-700 focus:ring-2 focus:ring-indigo-500/20 focus:outline-none cursor-pointer transition-all select-none"
-          title="Кликните сюда и нажмите Ctrl+V, чтобы добавить скриншот"
+          title="Кликните и нажмите Ctrl+V или перетащите файлы сюда мышкой"
         >
-          {images.length > 0 ? '+ Ctrl+V' : 'Ctrl+V'}
+          {isDraggingOver ? 'Отпустите...' : images.length > 0 ? '+ Ctrl+V / Drop' : 'Ctrl+V / Drop'}
         </div>
         <input
           ref={fileRef}
@@ -1238,7 +1334,7 @@ const exportToCSV = (data: any[], filename: string) => {
   link.click();
 };
 
-// === 5. СТРУКТУРА РАЗДЕЛОВ И ЗАДАЧ (17 РАЗДЕЛОВ) ===
+// === 5. СТРУКТУРА РАЗДЕЛОВ, ЗАДАЧ, РАЗРЕШЕНИЙ И ИСХОДНЫХ ФАЙЛОВ ===
 
 const DEFAULT_TASK_STATUSES = [
   'выполнено',
@@ -1247,6 +1343,13 @@ const DEFAULT_TASK_STATUSES = [
   'передано другому',
   'не требуется',
   'требует исправления',
+];
+
+const PERMISSION_STATUS_OPTIONS = [
+  'отправили на согласование',
+  'одобрен',
+  'требует исправления',
+  'не требуется',
 ];
 
 const PROJECT_SECTIONS_TEMPLATE = [
@@ -1450,16 +1553,19 @@ const createTasksFromTemplate = (existingTasks: any[] = []) => {
       code: sec.code,
       name: `📋 ${sec.title}`,
       isHeader: true,
+      building: '',
       status: '',
       priority: '',
       estHours: '',
       date: '',
       comment: '',
+      todayPlan: false,
     });
     sec.tasks.forEach((t) => {
       const matched = existingTasks.find(
         (old) =>
           !old.isHeader &&
+          !old.building &&
           (old.code === t.code ||
             (old.name || '').trim().toLowerCase() === t.name.trim().toLowerCase())
       );
@@ -1467,23 +1573,25 @@ const createTasksFromTemplate = (existingTasks: any[] = []) => {
         code: t.code,
         name: t.name,
         isHeader: false,
+        building: '',
         status: matched ? matched.status : '',
         priority: matched ? matched.priority || '' : '',
         estHours: matched ? matched.estHours || '' : '',
         date: matched ? matched.date : '',
         comment: matched ? matched.comment : '',
+        todayPlan: Boolean(matched?.todayPlan),
       });
     });
   });
 
-  let inCustomSection = false;
+  let inCustomOrBuildingSection = false;
   existingTasks.forEach((old) => {
     if (old.isHeader) {
-      inCustomSection = Boolean(old.isCustomSection);
-      if (inCustomSection) {
+      inCustomOrBuildingSection = Boolean(old.isCustomSection || old.building);
+      if (inCustomOrBuildingSection) {
         result.push(old);
       }
-    } else if (inCustomSection || old.isCustom) {
+    } else if (inCustomOrBuildingSection || old.isCustom || old.building) {
       result.push(old);
     }
   });
@@ -1498,15 +1606,72 @@ const DEFAULT_FILES = [
   'Проект safety',
   'Конструкция',
   'Проект HVAC',
-].map((f) => ({ name: f, status: '', date: '' }));
+].map((f) => ({ name: f, status: '', date: '', comment: '' }));
 
-const DEFAULT_PERMISSIONS = [
-  'Вертикали',
-  'Напорные приямки',
-  'Краны для напорных приямков',
-].map((p) => ({ name: p, status: '', date: '' }));
+const PERMISSIONS_TEMPLATE = [
+  { name: '1) Разрешение от городского комитета на строительство', isGroup: false },
+  { name: '2) Разрешение на вертикали:', isGroup: true },
+  { name: '2.1) От архитектора', isGroup: false, indent: true },
+  { name: '2.2) От конструктора', isGroup: false, indent: true },
+  { name: '2.3) От акустика', isGroup: false, indent: true },
+  { name: '3) Разрешение на насосные приямки от конструктора', isGroup: false },
+  { name: '4) Разрешение на напорные краны:', isGroup: true },
+  { name: '4.1) От архитектора', isGroup: false, indent: true },
+  { name: '4.2) От парковщика', isGroup: false, indent: true },
+  { name: '5) Разрешение подключения от корпорации', isGroup: false },
+  { name: '6) Разрешение ниспах:', isGroup: true },
+  { name: '6.1) От корпорации', isGroup: false, indent: true },
+  { name: '6.2) От контрольного института', isGroup: false, indent: true },
+  { name: '6.3) От министерства здравоохранения', isGroup: false, indent: true },
+  { name: '6.4) Разрешение ниспах никуз', isGroup: false, indent: true },
+  { name: '7) Одобрение схемы от гидролога', isGroup: false },
+];
+
+const createPermissionsFromTemplate = (existingPerms: any[] = []) => {
+  return PERMISSIONS_TEMPLATE.map((tpl) => {
+    const matched = existingPerms.find(
+      (old) =>
+        !old.isGroup &&
+        (old.name || '').trim().toLowerCase() === tpl.name.trim().toLowerCase()
+    );
+    return {
+      name: tpl.name,
+      isGroup: Boolean(tpl.isGroup),
+      indent: Boolean(tpl.indent),
+      status: matched ? matched.status || '' : '',
+      date: matched ? matched.date || '' : '',
+      comment: matched ? matched.comment || '' : '',
+    };
+  });
+};
+
+const DEFAULT_PERMISSIONS = createPermissionsFromTemplate();
+
+const createSystemProject0000 = () => ({
+  id: 'system_0000',
+  num: '0000',
+  name: 'Внутренние задачи / Методички / Разработка программ',
+  stage: 'Внутренняя работа',
+  deadline: '',
+  team: '',
+  comment: '',
+  noChecklist: true,
+  archived: false,
+  buildings: [],
+  blockers: [],
+  customStatuses: [],
+  tasks: [],
+  files: [],
+  permissions: [],
+  remarks: [],
+  revisions: [],
+});
+
+const isProjectWithoutChecklist = (proj: any) =>
+  Boolean(proj?.noChecklist) || (proj?.num || '').trim() === '0000';
 
 const calcProjectProgress = (proj: any) => {
+  if (isProjectWithoutChecklist(proj)) return 0;
   const tasks = proj.tasks || [];
   const actionable = tasks.filter((t: any) => !t.isHeader && t.status !== 'не требуется');
   const completed = actionable.filter((t: any) => t.status === 'выполнено');
@@ -1514,6 +1679,7 @@ const calcProjectProgress = (proj: any) => {
 };
 
 const calcProjectRemainingHours = (proj: any) => {
+  if (isProjectWithoutChecklist(proj)) return 0;
   const tasks = proj.tasks || [];
   let sum = 0;
   tasks.forEach((t: any) => {
@@ -1556,6 +1722,7 @@ function GlobalSearchModal({
     }> = [];
 
     projects.forEach((p) => {
+      const archTag = p.archived ? ' [АРХИВ]' : '';
       if (
         (p.num || '').toLowerCase().includes(q) ||
         (p.name || '').toLowerCase().includes(q) ||
@@ -1564,37 +1731,40 @@ function GlobalSearchModal({
       ) {
         list.push({
           id: `proj-${p.id}`,
-          category: 'Проект',
-          badgeColor: 'bg-indigo-100 text-indigo-800',
+          category: `Проект${archTag}`,
+          badgeColor: p.archived ? 'bg-slate-200 text-slate-700' : 'bg-indigo-100 text-indigo-800',
           title: `Проект #${p.num}${p.name ? ` — ${p.name}` : ''}`,
           subtitle: [p.stage, p.team].filter(Boolean).join(' • ') || 'Открыть карточку проекта',
           onClick: () => {
-            onSelectProject(p.id, 'tasks');
+            onSelectProject(p.id, isProjectWithoutChecklist(p) ? 'related' : 'tasks');
             onClose();
           },
         });
       }
 
-      (p.tasks || []).forEach((t: any, idx: number) => {
-        if (t.isHeader) return;
-        if (
-          (t.name || '').toLowerCase().includes(q) ||
-          (t.code || '').toLowerCase().includes(q) ||
-          (t.comment || '').toLowerCase().includes(q)
-        ) {
-          list.push({
-            id: `ptask-${p.id}-${idx}`,
-            category: `Чек-лист #${p.num}`,
-            badgeColor: 'bg-emerald-100 text-emerald-800',
-            title: `${t.code ? `${t.code} ` : ''}${t.name}`,
-            subtitle: `Статус: ${t.status || 'не задан'}${t.comment ? ` • ${t.comment}` : ''}`,
-            onClick: () => {
-              onSelectProject(p.id, 'tasks');
-              onClose();
-            },
-          });
-        }
-      });
+      if (!isProjectWithoutChecklist(p)) {
+        (p.tasks || []).forEach((t: any, idx: number) => {
+          if (t.isHeader) return;
+          if (
+            (t.name || '').toLowerCase().includes(q) ||
+            (t.code || '').toLowerCase().includes(q) ||
+            (t.comment || '').toLowerCase().includes(q) ||
+            (t.building || '').toLowerCase().includes(q)
+          ) {
+            list.push({
+              id: `ptask-${p.id}-${idx}`,
+              category: `Чек-лист #${p.num}${archTag}`,
+              badgeColor: 'bg-emerald-100 text-emerald-800',
+              title: `${t.building ? `[${t.building}] ` : ''}${t.code ? `${t.code} ` : ''}${t.name}`,
+              subtitle: `Статус: ${t.status || 'не задан'}${t.comment ? ` • ${t.comment}` : ''}`,
+              onClick: () => {
+                onSelectProject(p.id, 'tasks');
+                onClose();
+              },
+            });
+          }
+        });
+      }
 
       (p.remarks || []).forEach((r: any) => {
         if (
@@ -1604,7 +1774,7 @@ function GlobalSearchModal({
         ) {
           list.push({
             id: `rem-${p.id}-${r.id}`,
-            category: `Замечание #${p.num}`,
+            category: `Замечание #${p.num}${archTag}`,
             badgeColor: 'bg-amber-100 text-amber-800',
             title: r.desc || '(без описания)',
             subtitle: [r.to ? `Кому/От: ${r.to}` : '', r.status ? `Статус: ${r.status}` : '']
@@ -1627,7 +1797,7 @@ function GlobalSearchModal({
         ) {
           list.push({
             id: `rev-${p.id}-${rev.id}`,
-            category: `Выдача модели #${p.num}`,
+            category: `Выдача модели #${p.num}${archTag}`,
             badgeColor: 'bg-purple-100 text-purple-800',
             title: `${rev.stage || 'Передача'} — ${rev.version || rev.format || 'Файл'}`,
             subtitle: [rev.recipient ? `Кому: ${rev.recipient}` : '', rev.date].filter(Boolean).join(' • '),
@@ -1706,7 +1876,7 @@ function GlobalSearchModal({
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Поиск по проектам, чек-листам, замечаниям, встречам, ревизиям..."
+            placeholder="Поиск по активным и архивным проектам, корпусам, чек-листам, встречам..."
             className="w-full text-sm text-slate-800 focus:outline-none"
           />
           <button
@@ -1720,7 +1890,7 @@ function GlobalSearchModal({
         <div className="max-h-[60vh] overflow-y-auto divide-y divide-slate-100">
           {!query.trim() ? (
             <div className="p-8 text-center text-xs text-slate-400">
-              Введите номер проекта, название узла, имя смежника или текст замечания...
+              Введите номер проекта, корпус (Здание A), название узла, смежника или текст замечания...
             </div>
           ) : results.length === 0 ? (
             <div className="p-8 text-center text-xs text-slate-400">
@@ -1753,7 +1923,7 @@ function GlobalSearchModal({
   );
 }
 
-// === 7. ВКЛАДКА 0: СВОДКА, ФОКУС ДНЯ И КАЛЕНДАРЬ ПЛАНИРОВАНИЯ ===
+// === 7. ВКЛАДКА 0: СВОДКА, ПЛАН НА СЕГОДНЯ И КАЛЕНДАРЬ ПЛАНИРОВАНИЯ ===
 
 function TabOverviewCalendar({
   projects,
@@ -1775,6 +1945,7 @@ function TabOverviewCalendar({
   const [newEventProject, setNewEventProject] = useState('');
   const [newEventTime, setNewEventTime] = useState('');
   const [focusProjectFilter, setFocusProjectFilter] = useState('');
+  const [onlyTodayPlan, setOnlyTodayPlan] = useState(false);
 
   const [showSources, setShowSources] = useState({
     deadlines: true,
@@ -1783,7 +1954,11 @@ function TabOverviewCalendar({
     custom: true,
   });
 
-  // Единый список «В фокусе»: пункты чек-листа + активные задачи со встреч с датой выполнения
+  const activeProjects = useMemo(
+    () => projects.filter((p: any) => !p.archived),
+    [projects]
+  );
+
   const focusItems = useMemo(() => {
     const list: Array<{
       kind: 'checklist' | 'meeting';
@@ -1792,6 +1967,7 @@ function TabOverviewCalendar({
       meetingId?: any;
       projectNum: string;
       projectName: string;
+      building?: string;
       taskIndex?: number;
       code: string;
       name: string;
@@ -1800,32 +1976,37 @@ function TabOverviewCalendar({
       priority: string;
       estHours: number;
       comment: string;
+      todayPlan: boolean;
     }> = [];
 
     const selectedProjObj = focusProjectFilter
-      ? projects.find((p: any) => p.id === focusProjectFilter)
+      ? activeProjects.find((p: any) => p.id === focusProjectFilter)
       : null;
 
-    projects.forEach((p: any) => {
+    activeProjects.forEach((p: any) => {
+      if (isProjectWithoutChecklist(p)) return;
       if (focusProjectFilter && p.id !== focusProjectFilter) return;
       (p.tasks || []).forEach((t: any, idx: number) => {
         if (t.isHeader) return;
         const st = (t.status || '').toLowerCase();
-        if (st === 'в работе' || st === 'требует исправления') {
+        const isTodayFlagged = Boolean(t.todayPlan);
+        if (st === 'в работе' || st === 'требует исправления' || (isTodayFlagged && st !== 'выполнено' && st !== 'не требуется')) {
           list.push({
             kind: 'checklist',
             uid: `chk-${p.id}-${idx}`,
             projectId: p.id,
             projectNum: p.num,
             projectName: p.name || '',
+            building: t.building || '',
             taskIndex: idx,
             code: t.code || '',
             name: t.name,
             dueDate: '',
-            status: t.status,
+            status: t.status || 'в работе',
             priority: String(t.priority || '').trim(),
             estHours: parseFloat(String(t.estHours || '').replace(',', '.')) || 0,
             comment: t.comment || '',
+            todayPlan: isTodayFlagged,
           });
         }
       });
@@ -1834,13 +2015,13 @@ function TabOverviewCalendar({
     (meetings || []).forEach((m: any) => {
       const st = (m.status || '').toLowerCase();
       if (['исправлено', 'не требуется', 'на паузе'].includes(st)) return;
-      // Показываем в фокусе пункты встреч, у которых указана дата "на когда сделать" или статус "в работе"
-      if (!m.dueDate && st !== 'в работе') return;
+      const isTodayFlagged = Boolean(m.todayPlan);
+      if (!m.dueDate && st !== 'в работе' && !isTodayFlagged) return;
       if (selectedProjObj && (m.projectNum || '').trim() !== (selectedProjObj.num || '').trim()) {
         return;
       }
 
-      const matchedProj = projects.find(
+      const matchedProj = activeProjects.find(
         (p: any) => (p.num || '').trim() === (m.projectNum || '').trim()
       );
       const titleText =
@@ -1862,11 +2043,14 @@ function TabOverviewCalendar({
         priority: '',
         estHours: 0,
         comment: m.comment || (m.date ? `Встреча от ${formatToDMY(m.date)}` : ''),
+        todayPlan: isTodayFlagged,
       });
     });
 
-    return list.sort((a, b) => {
-      // Сначала пункты с ближайшим сроком (dueDate)
+    const filteredByToday = onlyTodayPlan ? list.filter((item) => item.todayPlan) : list;
+
+    return filteredByToday.sort((a, b) => {
+      if (a.todayPlan !== b.todayPlan) return a.todayPlan ? -1 : 1;
       const dA = parseDateObj(a.dueDate);
       const dB = parseDateObj(b.dueDate);
       if (dA && dB) return dA.getTime() - dB.getTime();
@@ -1878,12 +2062,37 @@ function TabOverviewCalendar({
       if (!b.priority) return -1;
       return a.priority.localeCompare(b.priority, 'ru', { numeric: true });
     });
-  }, [projects, meetings, focusProjectFilter]);
+  }, [activeProjects, meetings, focusProjectFilter, onlyTodayPlan]);
 
   const totalFocusHours = useMemo(
     () => Number(focusItems.reduce((acc, item) => acc + item.estHours, 0).toFixed(1)),
     [focusItems]
   );
+
+  const handleToggleTodayPlanOnFocus = (item: any) => {
+    if (item.kind === 'meeting') {
+      setMeetings(
+        meetings.map((m: any) =>
+          m.id === item.meetingId ? { ...m, todayPlan: !m.todayPlan } : m
+        )
+      );
+      return;
+    }
+
+    setProjects(
+      projects.map((p: any) => {
+        if (p.id !== item.projectId) return p;
+        const updatedTasks = [...(p.tasks || [])];
+        if (updatedTasks[item.taskIndex]) {
+          updatedTasks[item.taskIndex] = {
+            ...updatedTasks[item.taskIndex],
+            todayPlan: !updatedTasks[item.taskIndex].todayPlan,
+          };
+        }
+        return { ...p, tasks: updatedTasks };
+      })
+    );
+  };
 
   const handleQuickUpdateFocusStatus = (item: any, newStatus: string) => {
     if (item.kind === 'meeting') {
@@ -1934,7 +2143,7 @@ function TabOverviewCalendar({
   };
 
   if (showSources.deadlines) {
-    projects.forEach((p: any) => {
+    activeProjects.forEach((p: any) => {
       if (p.deadline) {
         pushEvent(p.deadline, {
           id: `proj-${p.id}`,
@@ -1963,7 +2172,6 @@ function TabOverviewCalendar({
 
   if (showSources.meetings) {
     meetings.forEach((m: any) => {
-      // Если указан срок "на когда сделать" (dueDate), ставим в календарь на эту дату; иначе на дату встречи
       const targetCalendarDate = m.dueDate || m.date;
       if (targetCalendarDate) {
         const labelPrefix = m.dueDate ? 'Сделать по встрече: ' : 'Встреча: ';
@@ -2048,7 +2256,7 @@ function TabOverviewCalendar({
   const todayEvents = eventsByDate[todayDMY] || [];
   const selectedDayEvents = eventsByDate[selectedDayDMY] || [];
 
-  const urgentProjects = projects.filter((p: any) => {
+  const urgentProjects = activeProjects.filter((p: any) => {
     const u = getDeadlineUrgency(p.deadline);
     return u === 'overdue' || u === 'soon';
   });
@@ -2059,7 +2267,7 @@ function TabOverviewCalendar({
     return u === 'overdue' || u === 'soon';
   }).length;
 
-  const staleRemarksCount = projects.reduce((acc: number, p: any) => {
+  const staleRemarksCount = activeProjects.reduce((acc: number, p: any) => {
     const stale = (p.remarks || []).filter((r: any) => {
       const st = (r.status || '').toLowerCase();
       if (!['отправлен', 'частичный ответ'].includes(st)) return false;
@@ -2069,11 +2277,11 @@ function TabOverviewCalendar({
     return acc + stale.length;
   }, 0);
 
-  const totalActiveBlockers = projects.reduce(
+  const totalActiveBlockers = activeProjects.reduce(
     (acc: number, p: any) => acc + (p.blockers || []).filter((b: any) => !b.resolved).length,
     0
   );
-  const totalOpenRemarks = projects.reduce(
+  const totalOpenRemarks = activeProjects.reduce(
     (acc: number, p: any) =>
       acc +
       (p.remarks || []).filter(
@@ -2150,7 +2358,7 @@ function TabOverviewCalendar({
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
           <div className="text-xs font-medium text-slate-500">Активных проектов</div>
-          <div className="text-2xl font-bold text-slate-800 mt-1">{projects.length}</div>
+          <div className="text-2xl font-bold text-slate-800 mt-1">{activeProjects.length}</div>
         </div>
         <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
           <div className="text-xs font-medium text-slate-500">Активных блокеров</div>
@@ -2159,7 +2367,7 @@ function TabOverviewCalendar({
           </div>
         </div>
         <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
-          <div className="text-xs font-medium text-slate-500">Открытых замечаний</div>
+          <div className="text-xs font-medium text-slate-500">Открытых замечаний / вопросов</div>
           <div className={`text-2xl font-bold mt-1 ${totalOpenRemarks > 0 ? 'text-amber-600' : 'text-slate-800'}`}>
             {totalOpenRemarks}
           </div>
@@ -2170,13 +2378,13 @@ function TabOverviewCalendar({
         </div>
       </div>
 
-      {/* В ФОКУСЕ / ЧТО НЕОБХОДИМО ВЫПОЛНИТЬ ПО ВСЕМ ПРОЕКТАМ И ВСТРЕЧАМ */}
+      {/* В ФОКУСЕ / ПЛАН НА СЕГОДНЯ */}
       <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
         <div className="px-4 py-3 bg-slate-50/80 border-b border-slate-200/80 flex flex-wrap justify-between items-center gap-3">
           <div className="flex flex-wrap items-center gap-2.5">
             <Flame size={17} className="text-amber-500" />
             <h2 className="font-semibold text-sm text-slate-800">
-              В фокусе / Необходимо выполнить ({focusItems.length})
+              {onlyTodayPlan ? '★ План на сегодня' : 'В фокусе / Необходимо выполнить'} ({focusItems.length})
             </h2>
             {totalFocusHours > 0 && (
               <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200/80 flex items-center gap-1">
@@ -2185,14 +2393,28 @@ function TabOverviewCalendar({
             )}
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setOnlyTodayPlan(!onlyTodayPlan)}
+              className={`px-2.5 py-1 rounded-lg text-xs font-semibold border flex items-center gap-1.5 transition-colors ${
+                onlyTodayPlan
+                  ? 'bg-amber-400 text-slate-900 border-amber-500 shadow-xs'
+                  : 'bg-white hover:bg-amber-50 text-slate-700 border-slate-200'
+              }`}
+              title="Показать только задачи, отмеченные звёздочкой на сегодня"
+            >
+              <Star size={13} className={onlyTodayPlan ? 'fill-slate-900' : 'text-amber-500'} />
+              План на сегодня
+            </button>
+
             <select
               value={focusProjectFilter}
               onChange={(e) => setFocusProjectFilter(e.target.value)}
               className="px-2.5 py-1 text-xs bg-white border border-slate-200 rounded-lg text-slate-700 font-medium focus:outline-none"
             >
-              <option value="">Все проекты</option>
-              {projects.map((p: any) => (
+              <option value="">Все активные проекты</option>
+              {activeProjects.map((p: any) => (
                 <option key={p.id} value={p.id}>
                   Проект #{p.num} {p.name ? `— ${p.name}` : ''}
                 </option>
@@ -2203,13 +2425,16 @@ function TabOverviewCalendar({
 
         {focusItems.length === 0 ? (
           <div className="p-8 text-center text-xs text-slate-400">
-            Нет активных пунктов чек-листа или задач со встреч в работе.
+            {onlyTodayPlan
+              ? 'На сегодня пока не отмечено ни одной задачи. Нажмите ★ рядом с нужными задачами в чек-листе или встречах.'
+              : 'Нет активных пунктов чек-листа или задач со встреч в работе.'}
           </div>
         ) : (
           <div className="overflow-x-auto max-h-[360px] overflow-y-auto">
             <table className="w-full text-left border-collapse text-xs">
               <thead className="sticky top-0 bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-500 uppercase z-10">
                 <tr>
+                  <th className="py-2 px-2 w-8 text-center" title="План на сегодня">★</th>
                   <th className="py-2 px-3 w-28">Проект</th>
                   <th className="py-2 px-2 w-28">Срок / Приоритет</th>
                   <th className="py-2 px-3 min-w-[260px]">Что необходимо выполнить</th>
@@ -2226,13 +2451,32 @@ function TabOverviewCalendar({
                     <tr
                       key={item.uid}
                       className={
-                        urgency === 'overdue'
+                        item.todayPlan
+                          ? 'bg-amber-50/50 hover:bg-amber-100/50'
+                          : urgency === 'overdue'
                           ? 'bg-rose-50/60 hover:bg-rose-100/50'
                           : urgency === 'soon'
-                          ? 'bg-amber-50/40 hover:bg-amber-100/40'
+                          ? 'bg-amber-50/30 hover:bg-amber-100/40'
                           : 'hover:bg-slate-50/80'
                       }
                     >
+                      <td className="p-2 text-center">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleTodayPlanOnFocus(item)}
+                          className="p-0.5 rounded hover:bg-amber-100 transition-colors"
+                          title={item.todayPlan ? 'Убрать из плана на сегодня' : 'Добавить в план на сегодня'}
+                        >
+                          <Star
+                            size={15}
+                            className={
+                              item.todayPlan
+                                ? 'text-amber-500 fill-amber-400'
+                                : 'text-slate-300 hover:text-amber-400'
+                            }
+                          />
+                        </button>
+                      </td>
                       <td className="p-2.5">
                         {item.projectId ? (
                           <button
@@ -2286,6 +2530,11 @@ function TabOverviewCalendar({
                         )}
                       </td>
                       <td className="p-2.5 font-medium text-slate-700">
+                        {item.building && (
+                          <span className="inline-block px-1.5 py-0.5 mr-1.5 text-[10px] font-bold rounded bg-indigo-100 text-indigo-800">
+                            {item.building}
+                          </span>
+                        )}
                         {item.kind === 'meeting' ? (
                           <span className="inline-block px-1.5 py-0.5 mr-1.5 text-[10px] font-bold rounded bg-sky-100 text-sky-800">
                             Встреча
@@ -2323,23 +2572,24 @@ function TabOverviewCalendar({
         )}
       </div>
 
-      {/* Краткая сводка по проектам */}
+      {/* Краткая сводка по активным проектам */}
       <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
         <div className="px-4 py-3 bg-slate-50/80 border-b border-slate-200/80 flex flex-wrap justify-between items-center gap-2">
           <div className="flex items-center gap-2">
             <LayoutGrid size={17} className="text-indigo-600" />
-            <h2 className="font-semibold text-sm text-slate-800">Краткая сводка по всем проектам</h2>
+            <h2 className="font-semibold text-sm text-slate-800">Краткая сводка по активным проектам</h2>
           </div>
-          <span className="text-xs text-slate-400">Нажмите на карточку проекта, чтобы перейти в его чек-лист</span>
+          <span className="text-xs text-slate-400">Нажмите на карточку проекта, чтобы перейти в него</span>
         </div>
 
-        {projects.length === 0 ? (
+        {activeProjects.length === 0 ? (
           <div className="p-10 text-center text-sm text-slate-400">
-            Проектов пока нет. Создайте первый проект во вкладке «Статус проекта».
+            Активных проектов пока нет. Создайте первый проект во вкладке «Статус проекта».
           </div>
         ) : (
           <div className="p-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-            {projects.map((p: any) => {
+            {activeProjects.map((p: any) => {
+              const noChecklist = isProjectWithoutChecklist(p);
               const pct = calcProjectProgress(p);
               const remHours = calcProjectRemainingHours(p);
               const activeBlockers = (p.blockers || []).filter((b: any) => !b.resolved);
@@ -2361,17 +2611,24 @@ function TabOverviewCalendar({
               return (
                 <div
                   key={p.id}
-                  onClick={() => onOpenProject(p.id)}
-                  className="p-4 rounded-xl border border-slate-200/90 hover:border-indigo-400 hover:shadow-md bg-white cursor-pointer transition-all flex flex-col justify-between gap-3"
+                  onClick={() => onOpenProject(p.id, noChecklist ? 'related' : 'tasks')}
+                  className={`p-4 rounded-xl border hover:border-indigo-400 hover:shadow-md cursor-pointer transition-all flex flex-col justify-between gap-3 ${
+                    noChecklist ? 'bg-slate-50/70 border-slate-300/90' : 'bg-white border-slate-200/90'
+                  }`}
                 >
                   <div>
                     <div className="flex items-start justify-between gap-2">
                       <div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-bold text-base text-indigo-700">Проект #{p.num}</span>
                           {p.stage && (
                             <span className="px-2 py-0.5 text-[11px] font-semibold bg-indigo-50 text-indigo-700 rounded-md">
                               {p.stage}
+                            </span>
+                          )}
+                          {(p.buildings || []).length > 0 && (
+                            <span className="px-1.5 py-0.5 text-[10px] font-medium bg-slate-100 text-slate-600 rounded">
+                              Корпусов: {p.buildings.length}
                             </span>
                           )}
                         </div>
@@ -2396,20 +2653,26 @@ function TabOverviewCalendar({
                       )}
                     </div>
 
-                    <div className="mt-3">
-                      <div className="flex justify-between text-xs mb-1">
-                        <span className="text-slate-500">Готовность чек-листа</span>
-                        <span className="font-bold text-slate-800">
-                          {pct}% {remHours > 0 && <span className="text-slate-400 font-normal">(осталось {remHours} ч)</span>}
-                        </span>
+                    {!noChecklist ? (
+                      <div className="mt-3">
+                        <div className="flex justify-between text-xs mb-1">
+                          <span className="text-slate-500">Готовность чек-листа</span>
+                          <span className="font-bold text-slate-800">
+                            {pct}% {remHours > 0 && <span className="text-slate-400 font-normal">(осталось {remHours} ч)</span>}
+                          </span>
+                        </div>
+                        <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-emerald-500 transition-all"
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
                       </div>
-                      <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-emerald-500 transition-all"
-                          style={{ width: `${pct}%` }}
-                        />
+                    ) : (
+                      <div className="mt-3 text-[11px] text-slate-500 bg-white px-2.5 py-1.5 rounded-lg border border-slate-200/80">
+                        Служебный проект для задач, встреч, методичек и разработки ПО (без чек-листа)
                       </div>
-                    </div>
+                    )}
 
                     {activeBlockers.length > 0 && (
                       <div className="mt-2.5 px-2.5 py-1.5 rounded-lg bg-rose-50/80 border border-rose-200/80 text-[11px] text-rose-800 line-clamp-1">
@@ -2432,7 +2695,7 @@ function TabOverviewCalendar({
                           : 'bg-slate-50 text-slate-400 hover:bg-slate-100'
                       }`}
                     >
-                      Замечания: {openRemarks.length}
+                      {noChecklist ? 'Вопросы' : 'Замечания'}: {openRemarks.length}
                     </button>
                     <button
                       type="button"
@@ -2653,7 +2916,7 @@ function TabOverviewCalendar({
                   className="w-20 px-2 py-1.5 text-xs bg-white border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
                 />
                 <datalist id="projects-num-list">
-                  {projects.map((p: any) => (
+                  {activeProjects.map((p: any) => (
                     <option key={p.id} value={p.num}>
                       {p.name}
                     </option>
@@ -3107,7 +3370,7 @@ function TabMeetings({
         <div>
           <h2 className="text-lg font-semibold text-slate-800">Протоколы и результаты встреч</h2>
           <p className="text-xs text-slate-500">
-            Укажите срок в колонке «На когда», чтобы задача автоматически появилась в блоке «В фокусе» на главной странице
+            Отметьте звёздочкой ★ пункты в план на сегодня или укажите срок в колонке «На когда»
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -3141,6 +3404,7 @@ function TabMeetings({
                   screenshot: [],
                   status: 'в работе',
                   comment: '',
+                  todayPlan: false,
                 },
                 ...meetings,
               ])
@@ -3157,6 +3421,7 @@ function TabMeetings({
           <table className="w-full text-left border-collapse text-sm">
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                <th className="pt-3 pb-1.5 px-2 w-8 text-center" title="В план на сегодня">★</th>
                 <th className="pt-3 pb-1.5 px-3 w-28">Проект</th>
                 <th className="pt-3 pb-1.5 px-3 w-36">Дата встречи</th>
                 <th className="pt-3 pb-1.5 px-3 w-36">На когда</th>
@@ -3168,6 +3433,7 @@ function TabMeetings({
                 <th className="pt-3 pb-1.5 px-2 w-10"></th>
               </tr>
               <tr className="bg-slate-50/40 border-b border-slate-200">
+                <th className="pb-2.5 px-1"></th>
                 <th className="pb-2.5 px-2">
                   <ColTextFilter
                     value={filters.projectNum}
@@ -3233,7 +3499,7 @@ function TabMeetings({
             <tbody className="divide-y divide-slate-100">
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="py-12 text-center text-slate-400">
+                  <td colSpan={10} className="py-12 text-center text-slate-400">
                     Записей по заданным фильтрам не найдено.
                   </td>
                 </tr>
@@ -3254,6 +3520,23 @@ function TabMeetings({
                           : 'hover:bg-slate-50/70'
                       }`}
                     >
+                      <td className="p-2.5 text-center">
+                        <button
+                          type="button"
+                          onClick={() => updateItem(m.id, 'todayPlan', !m.todayPlan)}
+                          className="p-0.5 rounded hover:bg-amber-100 transition-colors"
+                          title={m.todayPlan ? 'Убрать из плана на сегодня' : 'В план на сегодня'}
+                        >
+                          <Star
+                            size={15}
+                            className={
+                              m.todayPlan
+                                ? 'text-amber-500 fill-amber-400'
+                                : 'text-slate-200 group-hover:text-slate-400'
+                            }
+                          />
+                        </button>
+                      </td>
                       <td className="p-2">
                         <input
                           placeholder="№..."
@@ -3353,6 +3636,7 @@ function ProjectStatusExportModal({
   totalRemainingHours: number;
   onClose: () => void;
 }) {
+  const noChecklist = isProjectWithoutChecklist(projectData);
   const [mode, setMode] = useState<'status' | 'hebrew_templates'>('status');
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([
     'в работе',
@@ -3385,28 +3669,31 @@ function ProjectStatusExportModal({
     tasks: any[];
   }> = [];
 
-  let currentSection = 'Общее';
-  let currentBucket: any[] = [];
+  if (!noChecklist) {
+    let currentSection = 'Общее';
+    let currentBucket: any[] = [];
 
-  (projectData.tasks || []).forEach((t: any) => {
-    if (t.isHeader) {
-      if (currentBucket.length > 0) {
-        filteredSections.push({ sectionTitle: currentSection, tasks: currentBucket });
+    (projectData.tasks || []).forEach((t: any) => {
+      if (t.isHeader) {
+        if (currentBucket.length > 0) {
+          filteredSections.push({ sectionTitle: currentSection, tasks: currentBucket });
+        }
+        const bldPrefix = t.building ? `[${t.building}] ` : '';
+        currentSection = bldPrefix + t.name.replace('📋 ', '').trim();
+        currentBucket = [];
+      } else {
+        const st = (t.status || '').trim();
+        const isMatch =
+          selectedStatuses.includes(st) ||
+          (selectedStatuses.includes('__EMPTY__') && !st);
+        if (isMatch) {
+          currentBucket.push(t);
+        }
       }
-      currentSection = t.name.replace('📋 ', '').trim();
-      currentBucket = [];
-    } else {
-      const st = (t.status || '').trim();
-      const isMatch =
-        selectedStatuses.includes(st) ||
-        (selectedStatuses.includes('__EMPTY__') && !st);
-      if (isMatch) {
-        currentBucket.push(t);
-      }
+    });
+    if (currentBucket.length > 0) {
+      filteredSections.push({ sectionTitle: currentSection, tasks: currentBucket });
     }
-  });
-  if (currentBucket.length > 0) {
-    filteredSections.push({ sectionTitle: currentSection, tasks: currentBucket });
   }
 
   const generatePlainText = () => {
@@ -3418,11 +3705,13 @@ function ProjectStatusExportModal({
     if (projectData.stage) lines.push(`Стадия: ${projectData.stage}`);
     if (projectData.deadline) lines.push(`Дедлайн этапа: ${formatToDMY(projectData.deadline)}`);
     if (projectData.team) lines.push(`Смежники: ${projectData.team}`);
-    lines.push(
-      `Общая готовность чек-листа: ${progressPercent}%${
-        totalRemainingHours > 0 ? ` (осталось ~${Number(totalRemainingHours.toFixed(1))} ч)` : ''
-      }`
-    );
+    if (!noChecklist) {
+      lines.push(
+        `Общая готовность чек-листа: ${progressPercent}%${
+          totalRemainingHours > 0 ? ` (осталось ~${Number(totalRemainingHours.toFixed(1))} ч)` : ''
+        }`
+      );
+    }
     lines.push('');
 
     lines.push(`=== 1. ЧТО БЛОКИРУЕТ ПРОЕКТ (${filteredBlockers.length}) ===`);
@@ -3458,26 +3747,29 @@ function ProjectStatusExportModal({
       lines.push('');
     }
 
-    const totalFilteredTasks = filteredSections.reduce((acc, s) => acc + s.tasks.length, 0);
-    lines.push(`=== 3. ПУНКТЫ ПРОЕКТИРОВАНИЯ ПО ВЫБРАННЫМ СТАТУСАМ (${totalFilteredTasks}) ===`);
-    if (filteredSections.length === 0) {
-      lines.push('Задач с выбранными статусами не найдено.');
-    } else {
-      filteredSections.forEach((sec) => {
-        lines.push(`\n${sec.sectionTitle}:`);
-        sec.tasks.forEach((t: any) => {
-          const codePart = t.code ? `${t.code} ` : '- ';
-          const statusLabel = t.status || 'не задан';
-          const extra = [
-            t.priority ? `Приоритет: ${t.priority}` : '',
-            t.date ? `Дата: ${formatToDMY(t.date)}` : '',
-            t.comment ? `Комментарий: ${t.comment}` : '',
-          ]
-            .filter(Boolean)
-            .join(' | ');
-          lines.push(`  • ${codePart}${t.name} — [${statusLabel}]${extra ? ` (${extra})` : ''}`);
+    if (!noChecklist) {
+      const totalFilteredTasks = filteredSections.reduce((acc, s) => acc + s.tasks.length, 0);
+      lines.push(`=== 3. ПУНКТЫ ПРОЕКТИРОВАНИЯ ПО ВЫБРАННЫМ СТАТУСАМ (${totalFilteredTasks}) ===`);
+      if (filteredSections.length === 0) {
+        lines.push('Задач с выбранными статусами не найдено.');
+      } else {
+        filteredSections.forEach((sec) => {
+          lines.push(`\n${sec.sectionTitle}:`);
+          sec.tasks.forEach((t: any) => {
+            const bldPart = t.building && !sec.sectionTitle.includes(`[${t.building}]`) ? `[${t.building}] ` : '';
+            const codePart = t.code ? `${t.code} ` : '- ';
+            const statusLabel = t.status || 'не задан';
+            const extra = [
+              t.priority ? `Приоритет: ${t.priority}` : '',
+              t.date ? `Дата: ${formatToDMY(t.date)}` : '',
+              t.comment ? `Комментарий: ${t.comment}` : '',
+            ]
+              .filter(Boolean)
+              .join(' | ');
+            lines.push(`  • ${bldPart}${codePart}${t.name} — [${statusLabel}]${extra ? ` (${extra})` : ''}`);
+          });
         });
-      });
+      }
     }
 
     return lines.join('\n');
@@ -3579,43 +3871,45 @@ function ProjectStatusExportModal({
                 </tbody>
               </table>`);
 
-    const tasksHtml =
-      filteredSections.length === 0
-        ? '<p style="color:#64748b;">Задач с выбранными статусами не найдено.</p>'
-        : `<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;width:100%;font-size:10pt;">
-            <thead>
-              <tr style="background:#f1f5f9;">
-                <th style="width:60px;">Пункт</th>
-                <th>Наименование работы</th>
-                <th style="width:130px;">Статус</th>
-                <th style="width:90px;">Дата</th>
-                <th>Комментарий</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${filteredSections
-                .map(
-                  (sec) => `
-                <tr style="background:#e2e8f0;">
-                  <td colspan="5"><b>${escapeHtml(sec.sectionTitle)}</b></td>
+    const tasksHtml = noChecklist
+      ? ''
+      : `<h2>${remarksMode === 'none' ? '2' : '3'}. Состояние разделов проектирования</h2>` +
+        (filteredSections.length === 0
+          ? '<p style="color:#64748b;">Задач с выбранными статусами не найдено.</p>'
+          : `<table border="1" cellspacing="0" cellpadding="6" style="border-collapse:collapse;width:100%;font-size:10pt;">
+              <thead>
+                <tr style="background:#f1f5f9;">
+                  <th style="width:60px;">Пункт</th>
+                  <th>Наименование работы</th>
+                  <th style="width:130px;">Статус</th>
+                  <th style="width:90px;">Дата</th>
+                  <th>Комментарий</th>
                 </tr>
-                ${sec.tasks
+              </thead>
+              <tbody>
+                ${filteredSections
                   .map(
-                    (t: any) => `
-                  <tr>
-                    <td align="center">${escapeHtml(t.code)}</td>
-                    <td>${escapeHtml(t.name)}</td>
-                    <td><b>${escapeHtml(t.status || 'не задан')}</b></td>
-                    <td>${escapeHtml(formatToDMY(t.date))}</td>
-                    <td>${escapeHtml(t.comment)}</td>
-                  </tr>`
+                    (sec) => `
+                  <tr style="background:#e2e8f0;">
+                    <td colspan="5"><b>${escapeHtml(sec.sectionTitle)}</b></td>
+                  </tr>
+                  ${sec.tasks
+                    .map(
+                      (t: any) => `
+                    <tr>
+                      <td align="center">${escapeHtml(t.code)}</td>
+                      <td>${t.building ? `<b>[${escapeHtml(t.building)}]</b> ` : ''}${escapeHtml(t.name)}</td>
+                      <td><b>${escapeHtml(t.status || 'не задан')}</b></td>
+                      <td>${escapeHtml(formatToDMY(t.date))}</td>
+                      <td>${escapeHtml(t.comment)}</td>
+                    </tr>`
+                    )
+                    .join('')}
+                `
                   )
                   .join('')}
-              `
-                )
-                .join('')}
-            </tbody>
-          </table>`;
+              </tbody>
+            </table>`);
 
     const fullHtml = `
       <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
@@ -3628,14 +3922,13 @@ function ProjectStatusExportModal({
           <b>Дата отчета:</b> ${getTodayDMY()} &nbsp;|&nbsp;
           ${projectData.stage ? `<b>Стадия:</b> ${escapeHtml(projectData.stage)} &nbsp;|&nbsp;` : ''}
           ${projectData.deadline ? `<b>Дедлайн этапа:</b> ${formatToDMY(projectData.deadline)} &nbsp;|&nbsp;` : ''}
-          <b>Готовность:</b> ${progressPercent}%
+          ${!noChecklist ? `<b>Готовность:</b> ${progressPercent}%` : ''}
         </p>
         ${projectData.team ? `<p><b>Смежники:</b> ${escapeHtml(projectData.team)}</p>` : ''}
         <hr/>
         <h2 style="color:#b91c1c;">1. Что блокирует проект (${filteredBlockers.length})</h2>
         ${blockersHtml}
         ${remarksHtml}
-        <h2>${remarksMode === 'none' ? '2' : '3'}. Состояние разделов проектирования</h2>
         ${tasksHtml}
       </body>
       </html>
@@ -3698,43 +3991,45 @@ function ProjectStatusExportModal({
 
         {mode === 'status' ? (
           <div className="p-4 bg-slate-50/50 border-b border-slate-200 space-y-3 text-xs">
-            <div>
-              <div className="font-semibold text-slate-700 mb-1.5">
-                Какие статусы задач включить из чек-листа:
+            {!noChecklist && (
+              <div>
+                <div className="font-semibold text-slate-700 mb-1.5">
+                  Какие статусы задач включить из чек-листа:
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[...availableStatuses, '__EMPTY__'].map((st) => {
+                    const label = st === '__EMPTY__' ? 'Без статуса (пусто)' : st;
+                    const active = selectedStatuses.includes(st);
+                    return (
+                      <button
+                        key={st}
+                        type="button"
+                        onClick={() => toggleStatus(st)}
+                        className={`px-2.5 py-1 rounded-full border font-medium transition-all ${
+                          active
+                            ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
+                            : 'bg-white text-slate-600 border-slate-200 hover:border-indigo-300'
+                        }`}
+                      >
+                        {active ? '✓ ' : ''}
+                        {label}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-              <div className="flex flex-wrap gap-1.5">
-                {[...availableStatuses, '__EMPTY__'].map((st) => {
-                  const label = st === '__EMPTY__' ? 'Без статуса (пусто)' : st;
-                  const active = selectedStatuses.includes(st);
-                  return (
-                    <button
-                      key={st}
-                      type="button"
-                      onClick={() => toggleStatus(st)}
-                      className={`px-2.5 py-1 rounded-full border font-medium transition-all ${
-                        active
-                          ? 'bg-indigo-600 text-white border-indigo-600 shadow-xs'
-                          : 'bg-white text-slate-600 border-slate-200 hover:border-indigo-300'
-                      }`}
-                    >
-                      {active ? '✓ ' : ''}
-                      {label}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            )}
 
             <div className="flex flex-wrap items-center gap-6 pt-1">
               <div className="flex items-center gap-2">
-                <span className="font-semibold text-slate-700">Замечания:</span>
+                <span className="font-semibold text-slate-700">Замечания / Вопросы:</span>
                 <select
                   value={remarksMode}
                   onChange={(e) => setRemarksMode(e.target.value as any)}
                   className="px-2.5 py-1 rounded-lg border border-slate-200 bg-white text-slate-700 font-medium focus:outline-none"
                 >
                   <option value="open">Только открытые</option>
-                  <option value="all">Все замечания ({(projectData.remarks || []).length})</option>
+                  <option value="all">Все записи ({(projectData.remarks || []).length})</option>
                   <option value="none">Не включать</option>
                 </select>
               </div>
@@ -3862,34 +4157,66 @@ function TabProjectStatus({
   const [newNum, setNewNum] = useState('');
   const [newName, setNewName] = useState('');
   const [newStage, setNewStage] = useState('');
+  const [newNoChecklist, setNewNoChecklist] = useState(false);
   const [newBlockerText, setNewBlockerText] = useState('');
   const [showResolvedBlockers, setShowResolvedBlockers] = useState(false);
   const [showOverviewGrid, setShowOverviewGrid] = useState(false);
+  const [showArchivedProjects, setShowArchivedProjects] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
   const [addingToSection, setAddingToSection] = useState<string | null>(null);
   const [customTaskName, setCustomTaskName] = useState('');
   const [copiedRemarks, setCopiedRemarks] = useState(false);
+
+  // Корпуса / Зоны (Multi-Building)
+  const [newBuildingName, setNewBuildingName] = useState('');
+  const [selectedBuildingFilter, setSelectedBuildingFilter] = useState('');
+  const [cloningSectionKey, setCloningSectionKey] = useState<string | null>(null);
+  const [cloneTargetBuilding, setCloneTargetBuilding] = useState('');
 
   const [selectedTaskIndices, setSelectedTaskIndices] = useState<number[]>([]);
   const [bulkStatusValue, setBulkStatusValue] = useState('выполнено');
 
   const [isAddingSection, setIsAddingSection] = useState(false);
   const [newSectionTitle, setNewSectionTitle] = useState('');
+  const [newSectionBuilding, setNewSectionBuilding] = useState('');
   const [isManagingStatuses, setIsManagingStatuses] = useState(false);
   const [newCustomStatus, setNewCustomStatus] = useState('');
   const [sortByPriority, setSortByPriority] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
 
+  const activeProject = projects.find((p: any) => p.id === activeProjectId) || null;
+  const noChecklist = isProjectWithoutChecklist(activeProject);
+
+  const selectableProjects = useMemo(() => {
+    return projects.filter(
+      (p: any) => showArchivedProjects || !p.archived || p.id === activeProjectId
+    );
+  }, [projects, showArchivedProjects, activeProjectId]);
+
+  const archivedCount = useMemo(
+    () => projects.filter((p: any) => p.archived).length,
+    [projects]
+  );
+
   useEffect(() => {
     setSelectedTaskIndices([]);
-  }, [activeProjectId]);
+    setSelectedBuildingFilter('');
+    setCloningSectionKey(null);
+    if (activeProject && isProjectWithoutChecklist(activeProject) && subTab === 'tasks') {
+      setSubTab('related');
+    }
+  }, [activeProjectId, activeProject]);
 
   useEffect(() => {
     if (externalSubTab) {
-      setSubTab(externalSubTab);
+      if (noChecklist && externalSubTab === 'tasks') {
+        setSubTab('related');
+      } else {
+        setSubTab(externalSubTab);
+      }
       if (onClearExternalSubTab) onClearExternalSubTab();
     }
-  }, [externalSubTab, onClearExternalSubTab]);
+  }, [externalSubTab, onClearExternalSubTab, noChecklist]);
 
   const [taskFilters, setTaskFilters] = useState({
     name: '',
@@ -3908,8 +4235,8 @@ function TabProjectStatus({
     resolution: '',
     status: '',
   });
-  const [permFilters, setPermFilters] = useState({ name: '', status: '', date: '' });
-  const [fileFilters, setFileFilters] = useState({ name: '', status: '', date: '' });
+  const [permFilters, setPermFilters] = useState({ name: '', status: '', date: '', comment: '' });
+  const [fileFilters, setFileFilters] = useState({ name: '', status: '', date: '', comment: '' });
   const [relMeetingFilters, setRelMeetingFilters] = useState({
     date: '',
     dueDate: '',
@@ -3926,18 +4253,29 @@ function TabProjectStatus({
     comment: '',
   });
 
-  const activeProject = projects.find((p: any) => p.id === activeProjectId) || null;
   const projectData = activeProject
     ? {
         ...activeProject,
         stage: activeProject.stage || '',
         deadline: activeProject.deadline || '',
         team: activeProject.team || '',
+        archived: Boolean(activeProject.archived),
+        buildings: activeProject.buildings || [],
         blockers: activeProject.blockers || [],
         customStatuses: activeProject.customStatuses || [],
-        tasks: activeProject.tasks || createTasksFromTemplate(),
-        files: activeProject.files || [...DEFAULT_FILES],
-        permissions: activeProject.permissions || [...DEFAULT_PERMISSIONS],
+        tasks: noChecklist ? [] : activeProject.tasks || createTasksFromTemplate(),
+        files: noChecklist
+          ? activeProject.files || []
+          : (activeProject.files || [...DEFAULT_FILES]).map((f: any) => ({
+              comment: '',
+              ...f,
+            })),
+        permissions: noChecklist
+          ? activeProject.permissions || []
+          : (activeProject.permissions || [...DEFAULT_PERMISSIONS]).map((p: any) => ({
+              comment: '',
+              ...p,
+            })),
         remarks: activeProject.remarks || [],
         revisions: activeProject.revisions || [],
       }
@@ -3947,15 +4285,16 @@ function TabProjectStatus({
     ? [...DEFAULT_TASK_STATUSES, ...projectData.customStatuses]
     : DEFAULT_TASK_STATUSES;
 
-  const usedPriorities: string[] = projectData
-    ? Array.from(
-        new Set(
-          projectData.tasks
-            .filter((t: any) => !t.isHeader && (t.priority || '').trim())
-            .map((t: any) => String(t.priority).trim())
+  const usedPriorities: string[] =
+    projectData && !noChecklist
+      ? Array.from(
+          new Set(
+            projectData.tasks
+              .filter((t: any) => !t.isHeader && (t.priority || '').trim())
+              .map((t: any) => String(t.priority).trim())
+          )
         )
-      )
-    : [];
+      : [];
 
   const updateField = (field: string, value: any) => {
     setProjects(projects.map((p: any) => (p.id === activeProjectId ? { ...p, [field]: value } : p)));
@@ -3964,6 +4303,7 @@ function TabProjectStatus({
   const handleCreateProject = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newNum.trim()) return;
+    const skipChecklist = newNoChecklist || newNum.trim() === '0000';
     const newProj = {
       id: Date.now().toString(),
       num: newNum.trim(),
@@ -3972,20 +4312,92 @@ function TabProjectStatus({
       deadline: '',
       team: '',
       comment: '',
+      noChecklist: skipChecklist,
+      archived: false,
+      buildings: [],
       blockers: [],
       customStatuses: [],
-      tasks: createTasksFromTemplate(),
-      files: [...DEFAULT_FILES],
-      permissions: [...DEFAULT_PERMISSIONS],
+      tasks: skipChecklist ? [] : createTasksFromTemplate(),
+      files: skipChecklist ? [] : [...DEFAULT_FILES],
+      permissions: skipChecklist ? [] : [...DEFAULT_PERMISSIONS],
       remarks: [],
       revisions: [],
     };
     setProjects([...projects, newProj]);
     setActiveProjectId(newProj.id);
+    if (skipChecklist) setSubTab('related');
     setNewNum('');
     setNewName('');
     setNewStage('');
+    setNewNoChecklist(false);
     setIsCreating(false);
+  };
+
+  // Управление корпусами (Multi-Building)
+  const handleAddBuilding = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newBuildingName.trim() || !projectData) return;
+    const trimmed = newBuildingName.trim();
+    if (!projectData.buildings.includes(trimmed)) {
+      updateField('buildings', [...projectData.buildings, trimmed]);
+    }
+    setNewBuildingName('');
+  };
+
+  const handleRemoveBuilding = (bld: string) => {
+    if (!projectData) return;
+    updateField(
+      'buildings',
+      projectData.buildings.filter((item: string) => item !== bld)
+    );
+    if (selectedBuildingFilter === bld) {
+      setSelectedBuildingFilter('');
+    }
+  };
+
+  const handleCloneSectionForBuilding = (sectionHeaderIndex: number, targetBld: string) => {
+    if (!projectData || !targetBld.trim()) return;
+    const bld = targetBld.trim();
+    const tasksArr = [...projectData.tasks];
+    const headerItem = tasksArr[sectionHeaderIndex];
+    if (!headerItem || !headerItem.isHeader) return;
+
+    // Автоматически добавим корпус в список проекта, если его там еще нет
+    const updatedBuildings = projectData.buildings.includes(bld)
+      ? projectData.buildings
+      : [...projectData.buildings, bld];
+
+    const clonedItems: any[] = [
+      {
+        ...headerItem,
+        building: bld,
+        isCustomSection: true,
+      },
+    ];
+
+    let cursor = sectionHeaderIndex + 1;
+    while (cursor < tasksArr.length && !tasksArr[cursor].isHeader) {
+      clonedItems.push({
+        ...tasksArr[cursor],
+        building: bld,
+        status: '',
+        date: '',
+        comment: '',
+        todayPlan: false,
+      });
+      cursor++;
+    }
+
+    tasksArr.splice(cursor, 0, ...clonedItems);
+    setProjects(
+      projects.map((p: any) =>
+        p.id === activeProjectId
+          ? { ...p, buildings: updatedBuildings, tasks: tasksArr }
+          : p
+      )
+    );
+    setCloningSectionKey(null);
+    setCloneTargetBuilding('');
   };
 
   const handleMigrateToNewTemplate = () => {
@@ -3993,6 +4405,17 @@ function TabProjectStatus({
     const upgradedTasks = createTasksFromTemplate(projectData.tasks);
     updateField('tasks', upgradedTasks);
   };
+
+  const handleUpgradePermissionsToNewTemplate = () => {
+    if (!projectData) return;
+    const upgradedPerms = createPermissionsFromTemplate(projectData.permissions);
+    updateField('permissions', upgradedPerms);
+  };
+
+  const isLegacyPermissions =
+    projectData &&
+    !noChecklist &&
+    projectData.permissions.length < PERMISSIONS_TEMPLATE.length;
 
   const toggleTaskSelection = (idx: number) => {
     setSelectedTaskIndices((prev) =>
@@ -4028,29 +4451,31 @@ function TabProjectStatus({
       name: `📋 ${formattedTitle}`,
       isHeader: true,
       isCustomSection: true,
+      building: newSectionBuilding.trim(),
       status: '',
       priority: '',
       estHours: '',
       date: '',
       comment: '',
+      todayPlan: false,
     };
 
     updateField('tasks', [...projectData.tasks, newHeader]);
     setNewSectionTitle('');
+    setNewSectionBuilding('');
     setIsAddingSection(false);
   };
 
-  const handleDeleteCustomSection = (sectionHeaderName: string) => {
+  const handleDeleteSectionByHeaderIndex = (headerIndex: number) => {
     if (!projectData) return;
     const tasksArr = [...projectData.tasks];
-    const startIdx = tasksArr.findIndex((t: any) => t.isHeader && t.name === sectionHeaderName);
-    if (startIdx === -1) return;
+    if (!tasksArr[headerIndex]?.isHeader) return;
 
-    let endIdx = startIdx + 1;
+    let endIdx = headerIndex + 1;
     while (endIdx < tasksArr.length && !tasksArr[endIdx].isHeader) {
       endIdx++;
     }
-    tasksArr.splice(startIdx, endIdx - startIdx);
+    tasksArr.splice(headerIndex, endIdx - headerIndex);
     updateField('tasks', tasksArr);
   };
 
@@ -4112,13 +4537,14 @@ function TabProjectStatus({
     );
   };
 
-  const handleAddCustomTaskToSection = (sectionHeaderName: string) => {
+  const handleAddCustomTaskToSection = (headerIdx: number) => {
     if (!customTaskName.trim() || !projectData) return;
     const tasksArr = [...projectData.tasks];
-    const headerIdx = tasksArr.findIndex((t: any) => t.isHeader && t.name === sectionHeaderName);
-    if (headerIdx === -1) return;
+    const headerItem = tasksArr[headerIdx];
+    if (!headerItem || !headerItem.isHeader) return;
 
-    const sectionCode = tasksArr[headerIdx].code || '';
+    const sectionCode = headerItem.code || '';
+    const sectionBuilding = headerItem.building || '';
     let childCount = 0;
     let insertIdx = headerIdx + 1;
     while (insertIdx < tasksArr.length && !tasksArr[insertIdx].isHeader) {
@@ -4133,11 +4559,13 @@ function TabProjectStatus({
       name: customTaskName.trim(),
       isHeader: false,
       isCustom: true,
+      building: sectionBuilding,
       status: '',
       priority: '',
       estHours: '',
       date: '',
       comment: '',
+      todayPlan: false,
     });
 
     updateField('tasks', tasksArr);
@@ -4170,10 +4598,13 @@ function TabProjectStatus({
   };
 
   const buildGroupedSections = () => {
-    if (!projectData) return [];
+    if (!projectData || noChecklist) return [];
     const sections: Array<{
+      sectionKey: string;
+      headerIndex: number;
       headerName: string;
       displayTitle: string;
+      building: string;
       isCustomSection: boolean;
       items: Array<{ task: any; originalIndex: number }>;
       completedCount: number;
@@ -4189,8 +4620,11 @@ function TabProjectStatus({
           sections.push(currentSection);
         }
         currentSection = {
+          sectionKey: `sec-${idx}`,
+          headerIndex: idx,
           headerName: t.name,
           displayTitle: t.name.replace('📋 ', '').trim(),
+          building: t.building || '',
           isCustomSection: Boolean(t.isCustomSection),
           items: [],
           completedCount: 0,
@@ -4200,8 +4634,11 @@ function TabProjectStatus({
       } else {
         if (!currentSection) {
           currentSection = {
+            sectionKey: 'sec-default',
+            headerIndex: -1,
             headerName: '📋 Общее',
             displayTitle: 'Общее',
+            building: '',
             isCustomSection: false,
             items: [],
             completedCount: 0,
@@ -4246,12 +4683,15 @@ function TabProjectStatus({
   const totalRemainingHours = sectionsList.reduce((acc, s) => acc + s.remainingHours, 0);
 
   const isLegacyTemplate =
-    projectData && projectData.tasks.filter((t: any) => t.isHeader).length < PROJECT_SECTIONS_TEMPLATE.length;
+    projectData &&
+    !noChecklist &&
+    projectData.tasks.filter((t: any) => t.isHeader && !t.building && !t.isCustomSection).length <
+      PROJECT_SECTIONS_TEMPLATE.length;
 
   const toggleAllSections = (collapse: boolean) => {
     const next: Record<string, boolean> = {};
     sectionsList.forEach((sec) => {
-      next[sec.headerName] = collapse;
+      next[sec.sectionKey] = collapse;
     });
     setCollapsedSections(next);
   };
@@ -4276,29 +4716,52 @@ function TabProjectStatus({
 
   let fallbackCounter = 1;
 
+  const availableProjectSubTabs = noChecklist
+    ? [
+        { id: 'related', label: 'Встречи и Задачи', icon: MessageSquare, count: projectMeetings.length + projectQuickTasks.length },
+        { id: 'remarks', label: 'Вопросы и Заметки', icon: AlertCircle, count: projectData?.remarks.length || 0 },
+      ]
+    : [
+        { id: 'tasks', label: 'Инженерия (Чек-лист)', icon: Layers, count: projectData?.tasks.filter((t: any) => !t.isHeader).length || 0 },
+        { id: 'remarks', label: 'Замечания', icon: AlertCircle, count: projectData?.remarks.length || 0 },
+        { id: 'revisions', label: 'Выдача моделей / Ревизии', icon: Send, count: projectData?.revisions.length || 0 },
+        { id: 'docs', label: 'Разрешения и Файлы', icon: FileCheck2, count: (projectData?.permissions.filter((p: any) => !p.isGroup).length || 0) + (projectData?.files.length || 0) },
+        { id: 'related', label: 'Встречи и Задачи', icon: MessageSquare, count: projectMeetings.length + projectQuickTasks.length },
+      ];
+
   return (
     <div className="space-y-5">
       {projects.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setShowOverviewGrid(!showOverviewGrid)}
-            className="w-full px-4 py-2.5 bg-slate-50/80 hover:bg-slate-100/70 border-b border-slate-200/70 flex items-center justify-between text-xs font-semibold text-slate-600 transition-colors"
-          >
-            <span className="flex items-center gap-2">
+          <div className="px-4 py-2.5 bg-slate-50/80 border-b border-slate-200/70 flex flex-wrap items-center justify-between gap-2 text-xs font-semibold text-slate-600">
+            <button
+              type="button"
+              onClick={() => setShowOverviewGrid(!showOverviewGrid)}
+              className="flex items-center gap-2 hover:text-indigo-700 transition-colors"
+            >
               <LayoutGrid size={15} className="text-indigo-600" />
-              Быстрый переход между объектами ({projects.length})
-            </span>
-            <span className="text-slate-400 flex items-center gap-1">
-              {showOverviewGrid ? 'Свернуть' : 'Развернуть'}
+              Быстрый переход между объектами ({selectableProjects.length})
               {showOverviewGrid ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-            </span>
-          </button>
+            </button>
+
+            {archivedCount > 0 && (
+              <label className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-500 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={showArchivedProjects}
+                  onChange={(e) => setShowArchivedProjects(e.target.checked)}
+                  className="rounded text-indigo-600"
+                />
+                Показывать архивные ({archivedCount})
+              </label>
+            )}
+          </div>
 
           {showOverviewGrid && (
             <div className="p-3 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-              {projects.map((p: any) => {
+              {selectableProjects.map((p: any) => {
                 const isSelected = p.id === activeProjectId;
+                const skipChk = isProjectWithoutChecklist(p);
                 const pct = calcProjectProgress(p);
                 const blockersCnt = (p.blockers || []).filter((b: any) => !b.resolved).length;
                 const openRemarksCnt = (p.remarks || []).filter(
@@ -4311,15 +4774,22 @@ function TabProjectStatus({
                     key={p.id}
                     onClick={() => setActiveProjectId(p.id)}
                     className={`p-3 rounded-xl border cursor-pointer transition-all ${
-                      isSelected
+                      p.archived
+                        ? 'bg-slate-100/80 border-slate-300 opacity-75'
+                        : isSelected
                         ? 'bg-indigo-50/60 border-indigo-400 ring-2 ring-indigo-500/15'
                         : 'bg-white border-slate-200/80 hover:border-indigo-300 hover:shadow-xs'
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2 mb-1.5">
                       <div className="min-w-0">
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex items-center gap-1.5 flex-wrap">
                           <span className="font-bold text-sm text-indigo-700">#{p.num}</span>
+                          {p.archived && (
+                            <span className="px-1.5 py-0.5 text-[10px] font-bold bg-slate-200 text-slate-700 rounded">
+                              АРХИВ
+                            </span>
+                          )}
                           {p.stage && (
                             <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-slate-100 text-slate-600 rounded truncate max-w-[110px]">
                               {p.stage}
@@ -4330,15 +4800,17 @@ function TabProjectStatus({
                           {p.name || 'Без названия'}
                         </p>
                       </div>
-                      <span className="text-xs font-bold text-slate-700 shrink-0">{pct}%</span>
+                      {!skipChk && <span className="text-xs font-bold text-slate-700 shrink-0">{pct}%</span>}
                     </div>
 
-                    <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden mb-2.5">
-                      <div
-                        className="h-full bg-emerald-500 transition-all"
-                        style={{ width: `${pct}%` }}
-                      />
-                    </div>
+                    {!skipChk && (
+                      <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden mb-2.5">
+                        <div
+                          className="h-full bg-emerald-500 transition-all"
+                          style={{ width: `${pct}%` }}
+                        />
+                      </div>
+                    )}
 
                     <div className="flex items-center justify-between text-[11px] gap-1">
                       <div className="flex items-center gap-1.5">
@@ -4358,7 +4830,7 @@ function TabProjectStatus({
                               : 'bg-slate-100 text-slate-400'
                           }`}
                         >
-                          Зам: {openRemarksCnt}
+                          {skipChk ? 'Вопросы' : 'Зам'}: {openRemarksCnt}
                         </span>
                       </div>
 
@@ -4385,9 +4857,25 @@ function TabProjectStatus({
       )}
 
       <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm space-y-3">
+        {projectData?.archived && (
+          <div className="px-3 py-2 rounded-lg bg-slate-100 border border-slate-300 text-xs text-slate-700 flex items-center justify-between">
+            <span className="flex items-center gap-2 font-medium">
+              <Archive size={15} className="text-slate-600" />
+              Этот проект находится в архиве и скрыт из сводки на главной странице.
+            </span>
+            <button
+              type="button"
+              onClick={() => updateField('archived', false)}
+              className="text-indigo-700 font-semibold hover:underline"
+            >
+              Вернуть в активные
+            </button>
+          </div>
+        )}
+
         <div className="flex flex-col md:flex-row justify-between items-stretch md:items-center gap-3">
           <div className="flex flex-wrap items-center gap-3 flex-grow">
-            <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 flex-grow md:flex-grow-0 md:min-w-[320px]">
+            <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5 flex-grow md:flex-grow-0 md:min-w-[340px]">
               <FolderKanban size={18} className="text-indigo-600 shrink-0" />
               <select
                 className="w-full bg-transparent font-semibold text-slate-800 text-sm focus:outline-none cursor-pointer"
@@ -4397,15 +4885,15 @@ function TabProjectStatus({
                 <option value="" disabled>
                   Выберите проект из списка...
                 </option>
-                {projects.map((p: any) => (
+                {selectableProjects.map((p: any) => (
                   <option key={p.id} value={p.id}>
-                    Проект {p.num} {p.name ? `— ${p.name}` : ''}
+                    {p.archived ? '[АРХИВ] ' : ''}Проект {p.num} {p.name ? `— ${p.name}` : ''}
                   </option>
                 ))}
               </select>
             </div>
 
-            {projectData && (
+            {projectData && !noChecklist && (
               <div className="flex items-center gap-3 bg-slate-50 px-3 py-1.5 rounded-lg border border-slate-200/70">
                 <div className="text-xs text-slate-500">
                   Готовность: <span className="font-bold text-slate-800">{progressPercent}%</span>
@@ -4423,6 +4911,18 @@ function TabProjectStatus({
           <div className="flex flex-wrap items-center gap-2">
             {projectData && (
               <>
+                <button
+                  type="button"
+                  onClick={() => updateField('archived', !projectData.archived)}
+                  className={`px-3 py-2 rounded-lg text-xs font-semibold border flex items-center gap-1.5 transition-colors ${
+                    projectData.archived
+                      ? 'bg-slate-700 text-white border-slate-700'
+                      : 'bg-slate-50 hover:bg-slate-100 text-slate-600 border-slate-200'
+                  }`}
+                  title={projectData.archived ? 'Восстановить проект из архива' : 'Перенести завершённый проект в архив'}
+                >
+                  <Archive size={14} /> {projectData.archived ? 'Из архива' : 'В архив'}
+                </button>
                 <button
                   onClick={() => setIsExportModalOpen(true)}
                   className="bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 px-3.5 py-2 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
@@ -4449,106 +4949,170 @@ function TabProjectStatus({
         </div>
 
         {projectData && (
-          <div className="pt-3 border-t border-slate-100 grid grid-cols-1 md:grid-cols-3 gap-3">
-            <div className="flex items-center gap-2 bg-slate-50/70 px-3 py-1.5 rounded-lg border border-slate-200/70">
-              <span className="text-xs font-semibold text-slate-500 shrink-0">Стадия:</span>
-              <input
-                type="text"
-                list="stage-suggestions"
-                value={projectData.stage}
-                onChange={(e) => updateField('stage', e.target.value)}
-                placeholder="היתר / ביצוע / מכרז..."
-                className="w-full text-xs font-medium text-slate-800 bg-transparent focus:bg-white px-2 py-1 rounded focus:outline-none focus:ring-1 focus:ring-indigo-400"
-              />
-              <datalist id="stage-suggestions">
-                <option value="היתר (Подача)" />
-                <option value="מכרז (Тендер)" />
-                <option value="ביצוע (Рабочка)" />
-                <option value="סופרפוזיציה (Суперпозиция)" />
-              </datalist>
-            </div>
+          <>
+            <div className="pt-3 border-t border-slate-100 grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="flex items-center gap-2 bg-slate-50/70 px-3 py-1.5 rounded-lg border border-slate-200/70">
+                <span className="text-xs font-semibold text-slate-500 shrink-0">Стадия / Тип:</span>
+                <input
+                  type="text"
+                  list="stage-suggestions"
+                  value={projectData.stage}
+                  onChange={(e) => updateField('stage', e.target.value)}
+                  placeholder="היתר / ביצוע / מכרז..."
+                  className="w-full text-xs font-medium text-slate-800 bg-transparent focus:bg-white px-2 py-1 rounded focus:outline-none focus:ring-1 focus:ring-indigo-400"
+                />
+                <datalist id="stage-suggestions">
+                  <option value="היתר (Подача)" />
+                  <option value="מכרז (Тендер)" />
+                  <option value="ביצוע (Рабочка)" />
+                  <option value="סופרפוזיציה (Суперпозиция)" />
+                  <option value="Внутренняя работа" />
+                </datalist>
+              </div>
 
-            <div className="flex items-center gap-2 bg-slate-50/70 px-3 py-1.5 rounded-lg border border-slate-200/70">
-              <Clock size={14} className="text-slate-400 shrink-0" />
-              <span className="text-xs font-semibold text-slate-500 shrink-0">Дедлайн этапа:</span>
-              <div className="w-36">
-                <DateInput
-                  value={projectData.deadline}
-                  onChange={(val) => updateField('deadline', val)}
+              <div className="flex items-center gap-2 bg-slate-50/70 px-3 py-1.5 rounded-lg border border-slate-200/70">
+                <Clock size={14} className="text-slate-400 shrink-0" />
+                <span className="text-xs font-semibold text-slate-500 shrink-0">Дедлайн этапа:</span>
+                <div className="w-36">
+                  <DateInput
+                    value={projectData.deadline}
+                    onChange={(val) => updateField('deadline', val)}
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 bg-slate-50/70 px-3 py-1.5 rounded-lg border border-slate-200/70">
+                <UserCheck size={14} className="text-slate-400 shrink-0" />
+                <span className="text-xs font-semibold text-slate-500 shrink-0">Смежники / Участники:</span>
+                <input
+                  type="text"
+                  value={projectData.team}
+                  onChange={(e) => updateField('team', e.target.value)}
+                  placeholder="Архитектор, конструктор, BIM..."
+                  className="w-full text-xs text-slate-700 bg-transparent focus:bg-white px-2 py-1 rounded focus:outline-none focus:ring-1 focus:ring-indigo-400"
                 />
               </div>
             </div>
 
-            <div className="flex items-center gap-2 bg-slate-50/70 px-3 py-1.5 rounded-lg border border-slate-200/70">
-              <UserCheck size={14} className="text-slate-400 shrink-0" />
-              <span className="text-xs font-semibold text-slate-500 shrink-0">Смежники:</span>
-              <input
-                type="text"
-                value={projectData.team}
-                onChange={(e) => updateField('team', e.target.value)}
-                placeholder="Архитектор, конструктор, BIM..."
-                className="w-full text-xs text-slate-700 bg-transparent focus:bg-white px-2 py-1 rounded focus:outline-none focus:ring-1 focus:ring-indigo-400"
-              />
-            </div>
-          </div>
+            {/* ПАНЕЛЬ КОРПУСОВ / ЗОН (MULTI-BUILDING) */}
+            {!noChecklist && (
+              <div className="pt-2.5 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-slate-500 font-semibold flex items-center gap-1 mr-1">
+                    <Building2 size={14} className="text-indigo-600" /> Корпуса / Зоны:
+                  </span>
+                  {projectData.buildings.length === 0 ? (
+                    <span className="text-slate-400 text-[11px]">
+                      Не заданы (можно добавить Здание A, Здание B, Паркинг и дублировать под них разделы)
+                    </span>
+                  ) : (
+                    projectData.buildings.map((bld: string) => (
+                      <span
+                        key={bld}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-800 border border-indigo-200/80 font-semibold text-[11px]"
+                      >
+                        {bld}
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveBuilding(bld)}
+                          className="text-indigo-400 hover:text-rose-600"
+                          title="Убрать корпус из списка"
+                        >
+                          <X size={11} />
+                        </button>
+                      </span>
+                    ))
+                  )}
+                </div>
+
+                <form onSubmit={handleAddBuilding} className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={newBuildingName}
+                    onChange={(e) => setNewBuildingName(e.target.value)}
+                    placeholder="Здание A / Паркинг..."
+                    className="w-36 px-2.5 py-1 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                  />
+                  <button
+                    type="submit"
+                    className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-indigo-100 text-slate-700 hover:text-indigo-800 font-medium text-xs transition-colors"
+                  >
+                    + Корпус
+                  </button>
+                </form>
+              </div>
+            )}
+          </>
         )}
       </div>
 
       {isCreating && (
         <form
           onSubmit={handleCreateProject}
-          className="bg-indigo-50/60 border border-indigo-200 p-4 rounded-xl flex flex-col sm:flex-row items-end gap-3"
+          className="bg-indigo-50/60 border border-indigo-200 p-4 rounded-xl space-y-3"
         >
-          <div className="w-full sm:w-36">
-            <label className="block text-xs font-semibold text-slate-600 mb-1">Номер проекта *</label>
+          <div className="flex flex-col sm:flex-row items-end gap-3">
+            <div className="w-full sm:w-36">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Номер проекта *</label>
+              <input
+                type="text"
+                required
+                autoFocus
+                placeholder="Напр. 1621"
+                className="w-full px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                value={newNum}
+                onChange={(e) => setNewNum(e.target.value)}
+              />
+            </div>
+            <div className="w-full sm:w-44">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">Стадия</label>
+              <input
+                type="text"
+                list="stage-suggestions"
+                placeholder="היתר / ביצוע..."
+                className="w-full px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                value={newStage}
+                onChange={(e) => setNewStage(e.target.value)}
+              />
+            </div>
+            <div className="w-full sm:flex-grow">
+              <label className="block text-xs font-semibold text-slate-600 mb-1">
+                Наименование (необязательно)
+              </label>
+              <input
+                type="text"
+                placeholder="Жилой комплекс / Адрес..."
+                className="w-full px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+              />
+            </div>
+            <div className="flex gap-2 w-full sm:w-auto">
+              <button
+                type="submit"
+                className="flex-1 sm:flex-initial bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-1.5 rounded-lg text-sm font-medium"
+              >
+                Создать
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsCreating(false)}
+                className="px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-200/70 rounded-lg"
+              >
+                Отмена
+              </button>
+            </div>
+          </div>
+
+          <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
             <input
-              type="text"
-              required
-              autoFocus
-              placeholder="Напр. 1621"
-              className="w-full px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              value={newNum}
-              onChange={(e) => setNewNum(e.target.value)}
+              type="checkbox"
+              checked={newNoChecklist}
+              onChange={(e) => setNewNoChecklist(e.target.checked)}
+              className="rounded text-indigo-600"
             />
-          </div>
-          <div className="w-full sm:w-44">
-            <label className="block text-xs font-semibold text-slate-600 mb-1">Стадия</label>
-            <input
-              type="text"
-              list="stage-suggestions"
-              placeholder="היתר / ביצוע..."
-              className="w-full px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              value={newStage}
-              onChange={(e) => setNewStage(e.target.value)}
-            />
-          </div>
-          <div className="w-full sm:flex-grow">
-            <label className="block text-xs font-semibold text-slate-600 mb-1">
-              Наименование (необязательно)
-            </label>
-            <input
-              type="text"
-              placeholder="Жилой комплекс / Адрес..."
-              className="w-full px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-            />
-          </div>
-          <div className="flex gap-2 w-full sm:w-auto">
-            <button
-              type="submit"
-              className="flex-1 sm:flex-initial bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-1.5 rounded-lg text-sm font-medium"
-            >
-              Создать
-            </button>
-            <button
-              type="button"
-              onClick={() => setIsCreating(false)}
-              className="px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-200/70 rounded-lg"
-            >
-              Отмена
-            </button>
-          </div>
+            Служебный проект без стандартного инженерного чек-листа (только задачи, встречи и вопросы)
+          </label>
         </form>
       )}
 
@@ -4597,7 +5161,7 @@ function TabProjectStatus({
                   type="text"
                   value={newBlockerText}
                   onChange={(e) => setNewBlockerText(e.target.value)}
-                  placeholder="Опишите блокер (например: Нет архитектуры подвала, Ждем отчет гидролога)..."
+                  placeholder="Опишите блокер или важный вопрос (например: Нет архитектуры подвала, Ждем ответ...)"
                   className="flex-grow px-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:ring-2 focus:ring-rose-500/20 focus:border-rose-400"
                 />
                 <button
@@ -4652,13 +5216,7 @@ function TabProjectStatus({
           </div>
 
           <div className="flex flex-wrap gap-1.5 bg-slate-200/60 p-1 rounded-xl w-fit">
-            {[
-              { id: 'tasks', label: 'Инженерия (Чек-лист)', icon: Layers, count: projectData.tasks.filter((t: any) => !t.isHeader).length },
-              { id: 'remarks', label: 'Замечания', icon: AlertCircle, count: projectData.remarks.length },
-              { id: 'revisions', label: 'Выдача моделей / Ревизии', icon: Send, count: projectData.revisions.length },
-              { id: 'docs', label: 'Разрешения и Файлы', icon: FileCheck2, count: projectData.permissions.length + projectData.files.length },
-              { id: 'related', label: 'Встречи и Задачи', icon: MessageSquare, count: projectMeetings.length + projectQuickTasks.length },
-            ].map((item) => {
+            {availableProjectSubTabs.map((item) => {
               const Icon = item.icon;
               const isActive = subTab === item.id;
               return (
@@ -4685,8 +5243,8 @@ function TabProjectStatus({
             })}
           </div>
 
-          {/* РАЗДЕЛ 1: ИНЖЕНЕРНЫЕ ЗАДАЧИ */}
-          {subTab === 'tasks' && (
+          {/* РАЗДЕЛ 1: ИНЖЕНЕРНЫЕ ЗАДАЧИ (СКРЫТ ДЛЯ ПРОЕКТА 0000) */}
+          {!noChecklist && subTab === 'tasks' && (
             <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
               <datalist id="project-priorities-list">
                 {usedPriorities.map((pr) => (
@@ -4740,6 +5298,27 @@ function TabProjectStatus({
                       <Clock size={12} /> Осталось: {Number(totalRemainingHours.toFixed(1))} ч
                     </span>
                   )}
+
+                  {projectData.buildings.length > 0 && (
+                    <select
+                      value={selectedBuildingFilter}
+                      onChange={(e) => setSelectedBuildingFilter(e.target.value)}
+                      className={`px-2.5 py-1 text-xs font-semibold rounded-lg border focus:outline-none ${
+                        selectedBuildingFilter
+                          ? 'bg-indigo-50 border-indigo-300 text-indigo-800'
+                          : 'bg-slate-50 border-slate-200 text-slate-700'
+                      }`}
+                    >
+                      <option value="">Все корпуса / общие разделы</option>
+                      <option value="__GENERAL__">Только общие (без корпуса)</option>
+                      {projectData.buildings.map((b: string) => (
+                        <option key={b} value={b}>
+                          Корпус: {b}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+
                   {isLegacyTemplate && (
                     <button
                       type="button"
@@ -4833,15 +5412,29 @@ function TabProjectStatus({
                   onSubmit={handleAddCustomSection}
                   className="px-4 py-3 bg-indigo-50/70 border-b border-indigo-200/80 flex flex-wrap items-center gap-2"
                 >
-                  <span className="text-xs font-semibold text-indigo-900">Новый раздел для проекта:</span>
+                  <span className="text-xs font-semibold text-indigo-900">Новый раздел:</span>
                   <input
                     type="text"
                     autoFocus
                     value={newSectionTitle}
                     onChange={(e) => setNewSectionTitle(e.target.value)}
                     placeholder="Например: 18. Насосная станция или Бассейн..."
-                    className="flex-grow min-w-[240px] px-3 py-1.5 text-xs bg-white border border-indigo-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                    className="flex-grow min-w-[220px] px-3 py-1.5 text-xs bg-white border border-indigo-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
                   />
+                  {projectData.buildings.length > 0 && (
+                    <select
+                      value={newSectionBuilding}
+                      onChange={(e) => setNewSectionBuilding(e.target.value)}
+                      className="px-2.5 py-1.5 text-xs bg-white border border-indigo-300 rounded-lg text-slate-700"
+                    >
+                      <option value="">Без привязки к корпусу</option>
+                      {projectData.buildings.map((b: string) => (
+                        <option key={b} value={b}>
+                          Корпус: {b}
+                        </option>
+                      ))}
+                    </select>
+                  )}
                   <button
                     type="submit"
                     className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium"
@@ -4913,7 +5506,7 @@ function TabProjectStatus({
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
                     <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                      <th className="pt-2.5 pb-1.5 px-2 w-8 text-center">✓</th>
+                      <th className="pt-2.5 pb-1.5 px-2 w-14 text-center">✓ / ★</th>
                       <th className="pt-2.5 pb-1.5 px-2 w-14 text-center">Пункт</th>
                       <th className="pt-2.5 pb-1.5 px-3 min-w-[250px]">Раздел / Задача</th>
                       <th className="pt-2.5 pb-1.5 px-2 w-48">Статус</th>
@@ -4972,9 +5565,16 @@ function TabProjectStatus({
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {sectionsList.map((sec) => {
+                      if (selectedBuildingFilter) {
+                        if (selectedBuildingFilter === '__GENERAL__' && sec.building) return null;
+                        if (selectedBuildingFilter !== '__GENERAL__' && sec.building !== selectedBuildingFilter) {
+                          return null;
+                        }
+                      }
+
                       const hasFilter = Object.values(taskFilters).some(Boolean);
                       let visibleItems = sec.items.filter(({ task: t }) => {
-                        const searchStr = `${t.code || ''} ${t.name || ''}`.toLowerCase();
+                        const searchStr = `${t.building || ''} ${t.code || ''} ${t.name || ''}`.toLowerCase();
                         return (
                           (!taskFilters.name || searchStr.includes(taskFilters.name.toLowerCase())) &&
                           matchStatusFilter(t.status, taskFilters.status) &&
@@ -5004,29 +5604,34 @@ function TabProjectStatus({
 
                       if (hasFilter && visibleItems.length === 0) return null;
 
-                      const isCollapsed = !hasFilter && Boolean(collapsedSections[sec.headerName]);
+                      const isCollapsed = !hasFilter && Boolean(collapsedSections[sec.sectionKey]);
                       const isSectionComplete =
                         sec.totalActionable > 0 && sec.completedCount === sec.totalActionable;
 
                       return (
-                        <React.Fragment key={sec.headerName}>
+                        <React.Fragment key={sec.sectionKey}>
                           <tr className="bg-slate-100/90 hover:bg-slate-200/60 transition-colors">
                             <td colSpan={8} className="py-2 px-3">
-                              <div className="flex items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
                                 <button
                                   type="button"
                                   onClick={() =>
                                     setCollapsedSections({
                                       ...collapsedSections,
-                                      [sec.headerName]: !isCollapsed,
+                                      [sec.sectionKey]: !isCollapsed,
                                     })
                                   }
-                                  className="flex items-center gap-2 font-bold text-xs text-slate-700 uppercase tracking-wider text-left"
+                                  className="flex flex-wrap items-center gap-2 font-bold text-xs text-slate-700 uppercase tracking-wider text-left"
                                 >
                                   {isCollapsed ? (
                                     <ChevronRight size={15} className="text-slate-500" />
                                   ) : (
                                     <ChevronDown size={15} className="text-slate-500" />
+                                  )}
+                                  {sec.building && (
+                                    <span className="px-2 py-0.5 rounded bg-indigo-600 text-white text-[10px] font-bold normal-case">
+                                      {sec.building}
+                                    </span>
                                   )}
                                   <span>{sec.displayTitle}</span>
                                   <span
@@ -5047,41 +5652,89 @@ function TabProjectStatus({
                                 </button>
 
                                 <div className="flex items-center gap-1.5">
+                                  {sec.headerIndex !== -1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setCloningSectionKey(
+                                          cloningSectionKey === sec.sectionKey ? null : sec.sectionKey
+                                        );
+                                        setCloneTargetBuilding(projectData.buildings[0] || '');
+                                      }}
+                                      className="text-[11px] font-medium text-slate-600 hover:text-indigo-800 bg-white hover:bg-indigo-50 border border-slate-200/80 px-2 py-0.5 rounded flex items-center gap-1 transition-colors"
+                                      title="Скопировать этот раздел для отдельного корпуса / здания"
+                                    >
+                                      <Building2 size={11} /> Для корпуса
+                                    </button>
+                                  )}
                                   <button
                                     type="button"
                                     onClick={() => {
-                                      setCollapsedSections({ ...collapsedSections, [sec.headerName]: false });
+                                      setCollapsedSections({ ...collapsedSections, [sec.sectionKey]: false });
                                       setAddingToSection(
-                                        addingToSection === sec.headerName ? null : sec.headerName
+                                        addingToSection === sec.sectionKey ? null : sec.sectionKey
                                       );
                                       setCustomTaskName('');
                                     }}
-                                    className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800 bg-white hover:bg-indigo-50 border border-slate-200/80 px-2 py-0.5 rounded flex items-center gap-1 transition-colors"
-                                    title="Добавить свой пункт в этот раздел"
+                                    className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800 bg-white/80 hover:bg-white border border-indigo-200/70 px-2 py-0.5 rounded flex items-center gap-1 transition-colors"
                                   >
-                                    <Plus size={12} /> Задача
+                                    <Plus size={12} /> Подпункт
                                   </button>
-                                  {sec.isCustomSection && (
+                                  {sec.isCustomSection && sec.headerIndex !== -1 && (
                                     <button
                                       type="button"
-                                      onClick={() => handleDeleteCustomSection(sec.headerName)}
-                                      className="text-slate-400 hover:text-rose-600 bg-white border border-slate-200/80 p-1 rounded transition-colors"
-                                      title="Удалить добавленный раздел"
+                                      onClick={() => handleDeleteSectionByHeaderIndex(sec.headerIndex)}
+                                      className="text-slate-400 hover:text-rose-600 p-1 rounded hover:bg-white/70 transition-colors"
+                                      title="Удалить этот раздел"
                                     >
-                                      <Trash2 size={12} />
+                                      <Trash2 size={13} />
                                     </button>
                                   )}
                                 </div>
                               </div>
+
+                              {cloningSectionKey === sec.sectionKey && (
+                                <div className="mt-2 pt-2 border-t border-slate-200 flex flex-wrap items-center gap-2 text-xs normal-case font-normal">
+                                  <span className="font-semibold text-slate-700">
+                                    Дублировать раздел для корпуса:
+                                  </span>
+                                  <input
+                                    type="text"
+                                    list="project-buildings-datalist"
+                                    value={cloneTargetBuilding}
+                                    onChange={(e) => setCloneTargetBuilding(e.target.value)}
+                                    placeholder="Здание B / Паркинг..."
+                                    className="px-2.5 py-1 bg-white border border-indigo-300 rounded text-xs focus:outline-none"
+                                  />
+                                  <datalist id="project-buildings-datalist">
+                                    {projectData.buildings.map((b: string) => (
+                                      <option key={b} value={b} />
+                                    ))}
+                                  </datalist>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleCloneSectionForBuilding(sec.headerIndex, cloneTargetBuilding)
+                                    }
+                                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1 rounded font-medium"
+                                  >
+                                    Создать копию
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => setCloningSectionKey(null)}
+                                    className="text-slate-500 hover:text-slate-800 px-2 py-1"
+                                  >
+                                    Отмена
+                                  </button>
+                                </div>
+                              )}
                             </td>
                           </tr>
 
-                          {!isCollapsed && addingToSection === sec.headerName && (
+                          {addingToSection === sec.sectionKey && sec.headerIndex !== -1 && (
                             <tr className="bg-indigo-50/50">
-                              <td className="p-2 text-center text-xs text-indigo-400" colSpan={2}>
-                                +
-                              </td>
-                              <td colSpan={6} className="p-2">
+                              <td colSpan={8} className="p-2.5 px-4">
                                 <div className="flex items-center gap-2">
                                   <input
                                     type="text"
@@ -5091,16 +5744,16 @@ function TabProjectStatus({
                                     onKeyDown={(e) => {
                                       if (e.key === 'Enter') {
                                         e.preventDefault();
-                                        handleAddCustomTaskToSection(sec.headerName);
+                                        handleAddCustomTaskToSection(sec.headerIndex);
                                       }
                                     }}
-                                    placeholder="Название новой задачи в этом разделе..."
-                                    className="flex-grow px-2.5 py-1 text-xs bg-white border border-indigo-300 rounded focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                                    placeholder="Название дополнительного пункта..."
+                                    className="flex-grow px-3 py-1.5 text-xs bg-white border border-indigo-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
                                   />
                                   <button
                                     type="button"
-                                    onClick={() => handleAddCustomTaskToSection(sec.headerName)}
-                                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1 rounded text-xs font-medium"
+                                    onClick={() => handleAddCustomTaskToSection(sec.headerIndex)}
+                                    className="bg-indigo-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium"
                                   >
                                     Добавить
                                   </button>
@@ -5117,50 +5770,79 @@ function TabProjectStatus({
                           )}
 
                           {!isCollapsed &&
-                            visibleItems.map(({ task: t, originalIndex: i }) => {
-                              const itemCode = t.code || String(fallbackCounter++);
-                              const isMuted = t.status === 'не требуется';
-                              const isChecked = selectedTaskIndices.includes(i);
-
+                            visibleItems.map(({ task: t, originalIndex }) => {
+                              const isNotRequired = t.status === 'не требуется';
+                              const isChecked = selectedTaskIndices.includes(originalIndex);
                               return (
                                 <tr
-                                  key={i}
-                                  className={`group hover:bg-slate-50/80 transition-colors align-top ${
-                                    isChecked
-                                      ? 'bg-indigo-50/60'
-                                      : isMuted
-                                      ? 'opacity-50 bg-slate-50/40'
-                                      : ''
+                                  key={originalIndex}
+                                  className={`group transition-colors ${
+                                    t.todayPlan
+                                      ? 'bg-amber-50/40 hover:bg-amber-100/40'
+                                      : isChecked
+                                      ? 'bg-indigo-50/70'
+                                      : isNotRequired
+                                      ? 'bg-slate-50/40 opacity-60'
+                                      : 'hover:bg-slate-50/70'
                                   }`}
                                 >
-                                  <td className="p-2.5 text-center">
-                                    <input
-                                      type="checkbox"
-                                      checked={isChecked}
-                                      onChange={() => toggleTaskSelection(i)}
-                                      className="rounded border-slate-300 text-indigo-600 cursor-pointer"
-                                    />
+                                  <td className="p-2 text-center">
+                                    <div className="inline-flex items-center gap-1">
+                                      <input
+                                        type="checkbox"
+                                        checked={isChecked}
+                                        onChange={() => toggleTaskSelection(originalIndex)}
+                                        className="rounded text-indigo-600 cursor-pointer"
+                                        title="Выбрать для массового изменения статуса"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          const arr = [...projectData.tasks];
+                                          arr[originalIndex].todayPlan = !arr[originalIndex].todayPlan;
+                                          updateField('tasks', arr);
+                                        }}
+                                        className="p-0.5 rounded hover:bg-amber-100 transition-colors"
+                                        title={t.todayPlan ? 'Убрать из плана на сегодня' : 'В план на сегодня'}
+                                      >
+                                        <Star
+                                          size={14}
+                                          className={
+                                            t.todayPlan
+                                              ? 'text-amber-500 fill-amber-400'
+                                              : 'text-slate-200 group-hover:text-slate-400'
+                                          }
+                                        />
+                                      </button>
+                                    </div>
                                   </td>
-                                  <td className="p-2.5 text-center text-xs text-slate-400 font-mono font-semibold">
-                                    {itemCode}
+                                  <td className="p-2 text-center font-mono text-xs font-semibold text-slate-400">
+                                    {t.code || ''}
                                   </td>
                                   <td
-                                    className={`p-2.5 font-medium text-slate-700 whitespace-pre-wrap break-words ${
-                                      isMuted ? 'line-through' : ''
+                                    className={`p-2 font-medium ${
+                                      isNotRequired ? 'line-through text-slate-400' : 'text-slate-700'
                                     }`}
                                   >
                                     <div className="flex items-center justify-between gap-2">
-                                      <span>{t.name}</span>
+                                      <span>
+                                        {t.building && (
+                                          <span className="inline-block px-1.5 py-0.2 mr-1.5 text-[10px] font-bold rounded bg-indigo-50 text-indigo-700 border border-indigo-200/70">
+                                            {t.building}
+                                          </span>
+                                        )}
+                                        {t.name}
+                                      </span>
                                       {t.isCustom && (
                                         <button
                                           type="button"
                                           onClick={() => {
                                             const arr = projectData.tasks.filter(
-                                              (_: any, idx: number) => idx !== i
+                                              (_: any, idx: number) => idx !== originalIndex
                                             );
                                             updateField('tasks', arr);
                                           }}
-                                          className="text-slate-300 hover:text-rose-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                                          className="text-slate-300 hover:text-rose-500 opacity-0 group-hover:opacity-100 shrink-0"
                                           title="Удалить добавленный пункт"
                                         >
                                           <Trash2 size={13} />
@@ -5174,9 +5856,9 @@ function TabProjectStatus({
                                       options={availableTaskStatuses}
                                       onChange={(val) => {
                                         const arr = [...projectData.tasks];
-                                        arr[i].status = val;
-                                        if (val && !arr[i].date && val !== 'не требуется') {
-                                          arr[i].date = getTodayDMY();
+                                        arr[originalIndex].status = val;
+                                        if (val && !arr[originalIndex].date && val !== 'не требуется') {
+                                          arr[originalIndex].date = getTodayDMY();
                                         }
                                         updateField('tasks', arr);
                                       }}
@@ -5189,40 +5871,33 @@ function TabProjectStatus({
                                       value={t.priority || ''}
                                       onChange={(e) => {
                                         const arr = [...projectData.tasks];
-                                        arr[i].priority = e.target.value;
+                                        arr[originalIndex].priority = e.target.value;
                                         updateField('tasks', arr);
                                       }}
-                                      placeholder="—"
-                                      className={`w-full px-2 py-1 text-xs rounded-md border transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500/30 ${
-                                        (t.priority || '').trim()
-                                          ? 'bg-amber-50/80 border-amber-200/90 text-amber-900 font-medium'
-                                          : 'bg-transparent border-transparent hover:bg-slate-100/80 hover:border-slate-200 text-slate-700'
-                                      }`}
+                                      placeholder="1 / Срочно..."
+                                      className="w-full px-2 py-1 text-xs font-medium text-amber-900 bg-transparent hover:bg-amber-50/70 focus:bg-white focus:ring-2 focus:ring-indigo-500/30 rounded focus:outline-none"
                                     />
                                   </td>
                                   <td className="p-2">
-                                    <div className="relative flex items-center">
-                                      <input
-                                        type="number"
-                                        step="0.5"
-                                        min="0"
-                                        placeholder="0"
-                                        value={t.estHours || ''}
-                                        onChange={(e) => {
-                                          const arr = [...projectData.tasks];
-                                          arr[i].estHours = e.target.value;
-                                          updateField('tasks', arr);
-                                        }}
-                                        className="w-full px-2 py-1 text-xs text-center font-mono text-slate-700 bg-transparent hover:bg-slate-100/80 focus:bg-white focus:ring-2 focus:ring-indigo-500/30 rounded border border-transparent hover:border-slate-200 focus:border-indigo-300 focus:outline-none"
-                                      />
-                                    </div>
+                                    <input
+                                      type="text"
+                                      inputMode="decimal"
+                                      value={t.estHours || ''}
+                                      onChange={(e) => {
+                                        const arr = [...projectData.tasks];
+                                        arr[originalIndex].estHours = e.target.value;
+                                        updateField('tasks', arr);
+                                      }}
+                                      placeholder="0"
+                                      className="w-full px-2 py-1 text-xs text-center font-mono text-slate-700 bg-transparent hover:bg-slate-100/80 focus:bg-white focus:ring-2 focus:ring-indigo-500/30 rounded focus:outline-none"
+                                    />
                                   </td>
                                   <td className="p-2">
                                     <DateInput
                                       value={t.date}
                                       onChange={(val) => {
                                         const arr = [...projectData.tasks];
-                                        arr[i].date = val;
+                                        arr[originalIndex].date = val;
                                         updateField('tasks', arr);
                                       }}
                                     />
@@ -5232,11 +5907,11 @@ function TabProjectStatus({
                                       value={t.comment}
                                       onChange={(val) => {
                                         const arr = [...projectData.tasks];
-                                        arr[i].comment = val;
+                                        arr[originalIndex].comment = val;
                                         updateField('tasks', arr);
                                       }}
-                                      placeholder="Заметка..."
-                                      className="text-xs text-slate-600"
+                                      placeholder="Примечание..."
+                                      className="text-slate-600 text-xs"
                                     />
                                   </td>
                                 </tr>
@@ -5251,40 +5926,49 @@ function TabProjectStatus({
             </div>
           )}
 
-          {/* РАЗДЕЛ 2: ЗАМЕЧАНИЯ ПО ПРОЕКТУ */}
+          {/* РАЗДЕЛ 2: ЗАМЕЧАНИЯ И ВОПРОСЫ */}
           {subTab === 'remarks' && (
             <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
-              <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
+              <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-2">
                 <div>
-                  <h3 className="font-semibold text-slate-800">Реестр замечаний и координации</h3>
-                  <p className="text-xs text-slate-400">
-                    Можно прикрепить несколько скриншотов в одну строку и нанести пометки по клику. Замечания без ответа &gt; 5 дней подсвечиваются
+                  <h3 className="font-semibold text-slate-800">
+                    {noChecklist ? 'Вопросы, идеи и заметки' : 'Реестр замечаний и координации'}
+                  </h3>
+                  <p className="text-xs text-slate-500">
+                    Можно вставлять скриншоты через Ctrl+V или перетаскивать мышкой в ячейку
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
+                  {Object.values(remarkFilters).some(Boolean) && (
+                    <button
+                      onClick={() =>
+                        setRemarkFilters({
+                          date: '',
+                          to: '',
+                          desc: '',
+                          dateSent: '',
+                          dateAnswer: '',
+                          resolution: '',
+                          status: '',
+                        })
+                      }
+                      className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg flex items-center gap-1"
+                    >
+                      <RotateCcw size={13} /> Сбросить
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={handleCopyOpenRemarks}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 border transition-colors ${
+                    className={`px-3 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5 transition-colors ${
                       copiedRemarks
                         ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                         : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
                     }`}
-                    title="Скопировать список нерешенных замечаний для вставки в письмо"
                   >
                     {copiedRemarks ? <Check size={14} /> : <Copy size={14} />}
-                    {copiedRemarks ? 'Скопировано!' : 'Скопировать для письма'}
+                    {copiedRemarks ? 'Список скопирован!' : 'Копировать открытые'}
                   </button>
-                  {Object.values(remarkFilters).some(Boolean) && (
-                    <button
-                      onClick={() =>
-                        setRemarkFilters({ date: '', to: '', desc: '', dateSent: '', dateAnswer: '', resolution: '', status: '' })
-                      }
-                      className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1 rounded-lg flex items-center gap-1"
-                    >
-                      <RotateCcw size={12} /> Сбросить
-                    </button>
-                  )}
                   <button
                     onClick={() =>
                       updateField('remarks', [
@@ -5302,219 +5986,268 @@ function TabProjectStatus({
                         ...projectData.remarks,
                       ])
                     }
-                    className="bg-amber-500 hover:bg-amber-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 shadow-xs whitespace-nowrap"
+                    className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-sm"
                   >
-                    <Plus size={14} /> Добавить замечание
+                    <Plus size={15} /> {noChecklist ? 'Добавить вопрос' : 'Добавить замечание'}
                   </button>
                 </div>
               </div>
-
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
-                    <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                      <th className="pt-2.5 pb-1.5 px-2 w-36">Дата</th>
-                      <th className="pt-2.5 pb-1.5 px-2 w-32">Кому / От</th>
-                      <th className="pt-2.5 pb-1.5 px-2 min-w-[200px]">Описание</th>
-                      <th className="pt-2.5 pb-1.5 px-2 w-44 text-center">Скриншоты</th>
-                      <th className="pt-2.5 pb-1.5 px-2 w-36">Отправлено</th>
-                      <th className="pt-2.5 pb-1.5 px-2 w-36">Ответ</th>
-                      <th className="pt-2.5 pb-1.5 px-2 min-w-[180px]">Решение</th>
-                      <th className="pt-2.5 pb-1.5 px-2 w-44">Статус</th>
+                    <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                      <th className="pt-2.5 pb-1.5 px-3 w-36">Дата</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-36">{noChecklist ? 'Тема / Раздел' : 'Кому / От кого'}</th>
+                      <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Описание</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-44 text-center">Скриншоты</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-36">Отправлено</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-36">Ответ получен</th>
+                      <th className="pt-2.5 pb-1.5 px-3 min-w-[160px]">Решение</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-44">Статус</th>
                       <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
                     </tr>
                     <tr className="bg-slate-50/40 border-b border-slate-200">
-                      <th className="pb-2 px-1.5">
-                        <ColTextFilter value={remarkFilters.date} onChange={(v) => setRemarkFilters({ ...remarkFilters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={remarkFilters.date}
+                          onChange={(v) => setRemarkFilters({ ...remarkFilters, date: v })}
+                          placeholder="ДД/ММ/ГГГГ"
+                        />
                       </th>
-                      <th className="pb-2 px-1.5">
-                        <ColTextFilter value={remarkFilters.to} onChange={(v) => setRemarkFilters({ ...remarkFilters, to: v })} placeholder="Кому" />
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={remarkFilters.to}
+                          onChange={(v) => setRemarkFilters({ ...remarkFilters, to: v })}
+                        />
                       </th>
-                      <th className="pb-2 px-1.5">
-                        <ColTextFilter value={remarkFilters.desc} onChange={(v) => setRemarkFilters({ ...remarkFilters, desc: v })} />
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={remarkFilters.desc}
+                          onChange={(v) => setRemarkFilters({ ...remarkFilters, desc: v })}
+                        />
                       </th>
-                      <th className="pb-2 px-1.5"></th>
-                      <th className="pb-2 px-1.5">
-                        <ColTextFilter value={remarkFilters.dateSent} onChange={(v) => setRemarkFilters({ ...remarkFilters, dateSent: v })} placeholder="ДД/ММ/ГГГГ" />
+                      <th className="pb-2 px-2"></th>
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={remarkFilters.dateSent}
+                          onChange={(v) => setRemarkFilters({ ...remarkFilters, dateSent: v })}
+                          placeholder="ДД/ММ/ГГГГ"
+                        />
                       </th>
-                      <th className="pb-2 px-1.5">
-                        <ColTextFilter value={remarkFilters.dateAnswer} onChange={(v) => setRemarkFilters({ ...remarkFilters, dateAnswer: v })} placeholder="ДД/ММ/ГГГГ" />
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={remarkFilters.dateAnswer}
+                          onChange={(v) => setRemarkFilters({ ...remarkFilters, dateAnswer: v })}
+                          placeholder="ДД/ММ/ГГГГ"
+                        />
                       </th>
-                      <th className="pb-2 px-1.5">
-                        <ColTextFilter value={remarkFilters.resolution} onChange={(v) => setRemarkFilters({ ...remarkFilters, resolution: v })} />
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={remarkFilters.resolution}
+                          onChange={(v) => setRemarkFilters({ ...remarkFilters, resolution: v })}
+                        />
                       </th>
-                      <th className="pb-2 px-1.5">
+                      <th className="pb-2 px-2">
                         <ColSelectFilter
                           value={remarkFilters.status}
-                          options={['создан', 'отправлен', 'решен', 'частичный ответ', 'не актуальный']}
+                          options={['создан', 'отправлен', 'частичный ответ', 'решен', 'не актуальный']}
                           onChange={(v) => setRemarkFilters({ ...remarkFilters, status: v })}
                         />
                       </th>
-                      <th className="pb-2 px-1.5"></th>
+                      <th className="pb-2 px-2"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {projectData.remarks
-                      .filter((r: any) => {
-                        return (
-                          matchDateFilter(r.date, remarkFilters.date) &&
-                          (!remarkFilters.to || (r.to || '').toLowerCase().includes(remarkFilters.to.toLowerCase())) &&
-                          (!remarkFilters.desc || (r.desc || '').toLowerCase().includes(remarkFilters.desc.toLowerCase())) &&
-                          matchDateFilter(r.dateSent, remarkFilters.dateSent) &&
-                          matchDateFilter(r.dateAnswer, remarkFilters.dateAnswer) &&
-                          (!remarkFilters.resolution || (r.resolution || '').toLowerCase().includes(remarkFilters.resolution.toLowerCase())) &&
-                          matchStatusFilter(r.status, remarkFilters.status)
-                        );
-                      })
-                      .map((r: any) => {
-                        const i = projectData.remarks.findIndex((rm: any) => rm.id === r.id);
-                        const waitingDays =
-                          ['отправлен', 'частичный ответ'].includes((r.status || '').toLowerCase())
+                    {projectData.remarks.length === 0 ? (
+                      <tr>
+                        <td colSpan={9} className="py-10 text-center text-slate-400">
+                          Записей пока нет.
+                        </td>
+                      </tr>
+                    ) : (
+                      projectData.remarks
+                        .filter(
+                          (r: any) =>
+                            matchDateFilter(r.date, remarkFilters.date) &&
+                            (!remarkFilters.to || (r.to || '').toLowerCase().includes(remarkFilters.to.toLowerCase())) &&
+                            (!remarkFilters.desc || (r.desc || '').toLowerCase().includes(remarkFilters.desc.toLowerCase())) &&
+                            matchDateFilter(r.dateSent, remarkFilters.dateSent) &&
+                            matchDateFilter(r.dateAnswer, remarkFilters.dateAnswer) &&
+                            (!remarkFilters.resolution ||
+                              (r.resolution || '').toLowerCase().includes(remarkFilters.resolution.toLowerCase())) &&
+                            matchStatusFilter(r.status, remarkFilters.status)
+                        )
+                        .map((r: any) => {
+                          const st = (r.status || '').toLowerCase();
+                          const daysWaiting = ['отправлен', 'частичный ответ'].includes(st)
                             ? getDaysSinceDate(r.dateSent || r.date)
                             : null;
-                        const isStale = waitingDays !== null && waitingDays >= 5;
+                          const isStale = daysWaiting !== null && daysWaiting >= 5;
 
-                        return (
-                          <tr
-                            key={r.id}
-                            onPaste={(e) =>
-                              handlePasteImage(e, (img) => {
-                                const arr = [...projectData.remarks];
-                                const current = normalizeScreenshots(arr[i].screenshot);
-                                arr[i].screenshot = [...current, img];
-                                updateField('remarks', arr);
-                              })
-                            }
-                            className={`group align-top transition-colors ${
-                              isStale ? 'bg-amber-50/70 hover:bg-amber-100/60' : 'hover:bg-slate-50/70'
-                            }`}
-                          >
-                            <td className="p-2">
-                              <DateInput
-                                value={r.date}
-                                onChange={(val) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].date = val;
-                                  updateField('remarks', arr);
-                                }}
-                              />
-                            </td>
-                            <td className="p-2">
-                              <input
-                                placeholder="Архитектор..."
-                                className="w-full px-2 py-1 text-xs font-medium bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
-                                value={r.to}
-                                onChange={(e) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].to = e.target.value;
-                                  updateField('remarks', arr);
-                                }}
-                              />
-                            </td>
-                            <td className="p-2">
-                              <AutoTextarea
-                                value={r.desc}
-                                onChange={(val) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].desc = val;
-                                  updateField('remarks', arr);
-                                }}
-                                placeholder="Текст замечания..."
-                                className="text-xs"
-                              />
-                            </td>
-                            <td className="p-2 text-center">
-                              <ImageCell
-                                src={r.screenshot}
-                                onChange={(imgs) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].screenshot = imgs;
-                                  updateField('remarks', arr);
-                                }}
-                                onPreview={onPreviewImages}
-                              />
-                            </td>
-                            <td className="p-2">
-                              <DateInput
-                                value={r.dateSent}
-                                onChange={(val) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].dateSent = val;
-                                  updateField('remarks', arr);
-                                }}
-                              />
-                            </td>
-                            <td className="p-2">
-                              <DateInput
-                                value={r.dateAnswer}
-                                onChange={(val) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].dateAnswer = val;
-                                  updateField('remarks', arr);
-                                }}
-                              />
-                            </td>
-                            <td className="p-2">
-                              <AutoTextarea
-                                value={r.resolution}
-                                onChange={(val) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].resolution = val;
-                                  updateField('remarks', arr);
-                                }}
-                                placeholder="Как решено..."
-                                className="text-xs"
-                              />
-                            </td>
-                            <td className="p-2 space-y-1">
-                              <StatusPill
-                                value={r.status}
-                                options={['создан', 'отправлен', 'решен', 'частичный ответ', 'не актуальный']}
-                                onChange={(val) => {
-                                  const arr = [...projectData.remarks];
-                                  arr[i].status = val;
-                                  if (val === 'отправлен' && !arr[i].dateSent) {
-                                    arr[i].dateSent = getTodayDMY();
+                          return (
+                            <tr
+                              key={r.id}
+                              onPaste={(e) =>
+                                handlePasteImage(e, (img) => {
+                                  const next = projectData.remarks.map((item: any) =>
+                                    item.id === r.id
+                                      ? { ...item, screenshot: [...normalizeScreenshots(item.screenshot), img] }
+                                      : item
+                                  );
+                                  updateField('remarks', next);
+                                })
+                              }
+                              className={`group align-top ${
+                                isStale ? 'bg-amber-50/50 hover:bg-amber-100/40' : 'hover:bg-slate-50/70'
+                              }`}
+                            >
+                              <td className="p-2">
+                                <DateInput
+                                  value={r.date}
+                                  onChange={(val) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, date: val } : item
+                                      )
+                                    )
                                   }
-                                  updateField('remarks', arr);
-                                }}
-                              />
-                              {isStale && (
-                                <div className="text-[10px] font-bold text-amber-800 bg-amber-200/70 px-2 py-0.5 rounded-full text-center">
-                                  Ждет ответа {waitingDays} дн.
-                                </div>
-                              )}
-                            </td>
-                            <td className="p-2 text-center">
-                              <button
-                                onClick={() =>
-                                  updateField(
-                                    'remarks',
-                                    projectData.remarks.filter((rm: any) => rm.id !== r.id)
-                                  )
-                                }
-                                className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                              >
-                                <Trash2 size={14} />
-                              </button>
-                            </td>
-                          </tr>
-                        );
-                      })}
+                                />
+                              </td>
+                              <td className="p-2">
+                                <input
+                                  className="w-full px-2 py-1 text-xs font-medium bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
+                                  placeholder={noChecklist ? 'Тема...' : 'Архитектор...'}
+                                  value={r.to}
+                                  onChange={(e) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, to: e.target.value } : item
+                                      )
+                                    )
+                                  }
+                                />
+                              </td>
+                              <td className="p-2">
+                                <AutoTextarea
+                                  value={r.desc}
+                                  onChange={(val) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, desc: val } : item
+                                      )
+                                    )
+                                  }
+                                  placeholder="Текст..."
+                                />
+                              </td>
+                              <td className="p-2 text-center">
+                                <ImageCell
+                                  src={r.screenshot}
+                                  onChange={(imgs) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, screenshot: imgs } : item
+                                      )
+                                    )
+                                  }
+                                  onPreview={onPreviewImages}
+                                />
+                              </td>
+                              <td className="p-2">
+                                <DateInput
+                                  value={r.dateSent}
+                                  onChange={(val) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, dateSent: val } : item
+                                      )
+                                    )
+                                  }
+                                />
+                                {isStale && (
+                                  <div className="mt-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-bold text-center">
+                                    Ждём {daysWaiting} дн.
+                                  </div>
+                                )}
+                              </td>
+                              <td className="p-2">
+                                <DateInput
+                                  value={r.dateAnswer}
+                                  onChange={(val) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, dateAnswer: val } : item
+                                      )
+                                    )
+                                  }
+                                />
+                              </td>
+                              <td className="p-2">
+                                <AutoTextarea
+                                  value={r.resolution}
+                                  onChange={(val) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, resolution: val } : item
+                                      )
+                                    )
+                                  }
+                                  placeholder="Решение..."
+                                  className="text-xs text-slate-600"
+                                />
+                              </td>
+                              <td className="p-2">
+                                <StatusPill
+                                  value={r.status}
+                                  options={['создан', 'отправлен', 'частичный ответ', 'решен', 'не актуальный']}
+                                  onChange={(val) =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.map((item: any) =>
+                                        item.id === r.id ? { ...item, status: val } : item
+                                      )
+                                    )
+                                  }
+                                />
+                              </td>
+                              <td className="p-2 text-center">
+                                <button
+                                  onClick={() =>
+                                    updateField(
+                                      'remarks',
+                                      projectData.remarks.filter((item: any) => item.id !== r.id)
+                                    )
+                                  }
+                                  className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
+                                >
+                                  <Trash2 size={15} />
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })
+                    )}
                   </tbody>
                 </table>
               </div>
             </div>
           )}
 
-          {/* РАЗДЕЛ 3: ЖУРНАЛ ВЫДАЧИ МОДЕЛЕЙ И РЕВИЗИЙ */}
-          {subTab === 'revisions' && (
+          {/* РАЗДЕЛ 3: ЖУРНАЛ ВЫДАЧИ МОДЕЛЕЙ И ЧЕРТЕЖЕЙ (РЕВИЗИИ) */}
+          {!noChecklist && subTab === 'revisions' && (
             <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
-              <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
+              <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-2">
                 <div>
-                  <h3 className="font-semibold text-slate-800">Журнал передачи моделей и чертежей (Revit / DWG / PDF)</h3>
-                  <p className="text-xs text-slate-400">
-                    Фиксация всех отправленных ревизий смежникам, архитектору, в муниципалитет или заказчику
+                  <h3 className="font-semibold text-slate-800">Журнал передачи моделей и чертежей (Ревизии)</h3>
+                  <p className="text-xs text-slate-500">
+                    Фиксируйте каждую отправку RVT, IFC, DWG, PDF для суперпозиции, экспертизы или подрядчика
                   </p>
                 </div>
                 <button
@@ -5524,128 +6257,133 @@ function TabProjectStatus({
                       {
                         id: Date.now(),
                         date: getTodayDMY(),
-                        stage: projectData.stage || 'ביצוע',
-                        format: 'Revit + PDF',
-                        version: '',
+                        stage: projectData.stage || 'Суперпозиция',
+                        format: 'RVT + DWG + PDF',
+                        version: `Rev.${projectData.revisions.length + 1}`,
                         recipient: '',
-                        status: 'передана',
                         comment: '',
                       },
                       ...projectData.revisions,
                     ])
                   }
-                  className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-xs"
+                  className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-sm"
                 >
-                  <Plus size={14} /> Зафиксировать передачу
+                  <Plus size={15} /> Зафиксировать выдачу
                 </button>
               </div>
 
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
-                    <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                      <th className="py-2.5 px-3 w-36">Дата передачи</th>
-                      <th className="py-2.5 px-3 w-36">Этап / Цель</th>
-                      <th className="py-2.5 px-3 w-32">Формат</th>
-                      <th className="py-2.5 px-3 w-44">Версия / Имя файла</th>
-                      <th className="py-2.5 px-3 w-44">Кому передано</th>
-                      <th className="py-2.5 px-3 w-44">Статус</th>
-                      <th className="py-2.5 px-3 min-w-[200px]">Что изменено / Примечание</th>
+                    <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                      <th className="py-2.5 px-3 w-36">Дата выдачи</th>
+                      <th className="py-2.5 px-3 w-44">Цель / Стадия</th>
+                      <th className="py-2.5 px-3 w-40">Формат файлов</th>
+                      <th className="py-2.5 px-3 w-32">Версия / Ревизия</th>
+                      <th className="py-2.5 px-3 w-48">Кому передано</th>
+                      <th className="py-2.5 px-3 min-w-[220px]">Что изменено / Примечание</th>
                       <th className="py-2.5 px-2 w-10"></th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {projectData.revisions.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-12 text-center text-xs text-slate-400">
-                          Записей о передаче моделей или чертежей пока нет. Нажмите «Зафиксировать передачу».
+                        <td colSpan={7} className="py-10 text-center text-slate-400">
+                          Записей о передаче моделей пока нет.
                         </td>
                       </tr>
                     ) : (
-                      projectData.revisions.map((rev: any, idx: number) => (
+                      projectData.revisions.map((rev: any) => (
                         <tr key={rev.id} className="group hover:bg-slate-50/70 align-top">
                           <td className="p-2">
                             <DateInput
                               value={rev.date}
-                              onChange={(val) => {
-                                const arr = [...projectData.revisions];
-                                arr[idx].date = val;
-                                updateField('revisions', arr);
-                              }}
+                              onChange={(val) =>
+                                updateField(
+                                  'revisions',
+                                  projectData.revisions.map((item: any) =>
+                                    item.id === rev.id ? { ...item, date: val } : item
+                                  )
+                                )
+                              }
                             />
                           </td>
                           <td className="p-2">
                             <input
                               type="text"
-                              value={rev.stage}
-                              onChange={(e) => {
-                                const arr = [...projectData.revisions];
-                                arr[idx].stage = e.target.value;
-                                updateField('revisions', arr);
-                              }}
-                              placeholder="סופרפוזיציה / הגשה..."
-                              className="w-full px-2 py-1 text-xs font-medium bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
+                              value={rev.stage || ''}
+                              onChange={(e) =>
+                                updateField(
+                                  'revisions',
+                                  projectData.revisions.map((item: any) =>
+                                    item.id === rev.id ? { ...item, stage: e.target.value } : item
+                                  )
+                                )
+                              }
+                              placeholder="Суперпозиция / היתר..."
+                              className="w-full px-2 py-1 text-xs font-medium bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
                             />
                           </td>
                           <td className="p-2">
                             <input
                               type="text"
-                              value={rev.format}
-                              onChange={(e) => {
-                                const arr = [...projectData.revisions];
-                                arr[idx].format = e.target.value;
-                                updateField('revisions', arr);
-                              }}
-                              placeholder="RVT / NWC / DWG..."
-                              className="w-full px-2 py-1 text-xs font-mono text-indigo-700 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
+                              value={rev.format || ''}
+                              onChange={(e) =>
+                                updateField(
+                                  'revisions',
+                                  projectData.revisions.map((item: any) =>
+                                    item.id === rev.id ? { ...item, format: e.target.value } : item
+                                  )
+                                )
+                              }
+                              placeholder="RVT / IFC / DWG / PDF"
+                              className="w-full px-2 py-1 text-xs font-mono text-indigo-700 bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
                             />
                           </td>
                           <td className="p-2">
                             <input
                               type="text"
-                              value={rev.version}
-                              onChange={(e) => {
-                                const arr = [...projectData.revisions];
-                                arr[idx].version = e.target.value;
-                                updateField('revisions', arr);
-                              }}
-                              placeholder="Rev 02 / SUP_1621..."
-                              className="w-full px-2 py-1 text-xs bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
+                              value={rev.version || ''}
+                              onChange={(e) =>
+                                updateField(
+                                  'revisions',
+                                  projectData.revisions.map((item: any) =>
+                                    item.id === rev.id ? { ...item, version: e.target.value } : item
+                                  )
+                                )
+                              }
+                              placeholder="Rev.01"
+                              className="w-full px-2 py-1 text-xs font-bold text-slate-700 bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
                             />
                           </td>
                           <td className="p-2">
                             <input
                               type="text"
-                              value={rev.recipient}
-                              onChange={(e) => {
-                                const arr = [...projectData.revisions];
-                                arr[idx].recipient = e.target.value;
-                                updateField('revisions', arr);
-                              }}
-                              placeholder="BIM / Архитектор / ГИП..."
-                              className="w-full px-2 py-1 text-xs bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
-                            />
-                          </td>
-                          <td className="p-2">
-                            <StatusPill
-                              value={rev.status}
-                              options={['передана', 'на проверке', 'требует исправления', 'одобрен']}
-                              onChange={(val) => {
-                                const arr = [...projectData.revisions];
-                                arr[idx].status = val;
-                                updateField('revisions', arr);
-                              }}
+                              value={rev.recipient || ''}
+                              onChange={(e) =>
+                                updateField(
+                                  'revisions',
+                                  projectData.revisions.map((item: any) =>
+                                    item.id === rev.id ? { ...item, recipient: e.target.value } : item
+                                  )
+                                )
+                              }
+                              placeholder="BIM / Архитектор / Заказчик"
+                              className="w-full px-2 py-1 text-xs bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
                             />
                           </td>
                           <td className="p-2">
                             <AutoTextarea
                               value={rev.comment}
-                              onChange={(val) => {
-                                const arr = [...projectData.revisions];
-                                arr[idx].comment = val;
-                                updateField('revisions', arr);
-                              }}
-                              placeholder="Какие изменения вошли в ревизию..."
+                              onChange={(val) =>
+                                updateField(
+                                  'revisions',
+                                  projectData.revisions.map((item: any) =>
+                                    item.id === rev.id ? { ...item, comment: val } : item
+                                  )
+                                )
+                              }
+                              placeholder="Описание ревизии..."
                               className="text-xs text-slate-600"
                             />
                           </td>
@@ -5658,9 +6396,9 @@ function TabProjectStatus({
                                   projectData.revisions.filter((item: any) => item.id !== rev.id)
                                 )
                               }
-                              className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                              className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
                             >
-                              <Trash2 size={14} />
+                              <Trash2 size={15} />
                             </button>
                           </td>
                         </tr>
@@ -5673,14 +6411,26 @@ function TabProjectStatus({
           )}
 
           {/* РАЗДЕЛ 4: РАЗРЕШЕНИЯ И ФАЙЛЫ */}
-          {subTab === 'docs' && (
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+          {!noChecklist && subTab === 'docs' && (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
-                <div className="p-4 border-b border-slate-100 flex justify-between items-center">
-                  <h3 className="font-semibold text-slate-800">Согласования и разрешения</h3>
+                <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-2">
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-semibold text-slate-800">Разрешения и согласования</h3>
+                    {isLegacyPermissions && (
+                      <button
+                        type="button"
+                        onClick={handleUpgradePermissionsToNewTemplate}
+                        className="text-[11px] font-medium text-indigo-700 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2 py-0.5 rounded flex items-center gap-1"
+                        title="Обновить список разрешений по актуальному шаблону (1–7)"
+                      >
+                        <RefreshCw size={11} /> Обновить список
+                      </button>
+                    )}
+                  </div>
                   {Object.values(permFilters).some(Boolean) && (
                     <button
-                      onClick={() => setPermFilters({ name: '', status: '', date: '' })}
+                      onClick={() => setPermFilters({ name: '', status: '', date: '', comment: '' })}
                       className="text-xs text-rose-600 hover:underline"
                     >
                       Сбросить
@@ -5690,73 +6440,121 @@ function TabProjectStatus({
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
                     <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                      <th className="pt-2.5 pb-1.5 px-3">Элемент</th>
-                      <th className="pt-2.5 pb-1.5 px-3 w-48">Статус</th>
-                      <th className="pt-2.5 pb-1.5 px-3 w-36">Дата</th>
+                      <th className="pt-2.5 pb-1.5 px-3">Наименование</th>
+                      <th className="pt-2.5 pb-1.5 px-2 w-48">Статус</th>
+                      <th className="pt-2.5 pb-1.5 px-2 w-32">Дата</th>
+                      <th className="pt-2.5 pb-1.5 px-2 min-w-[140px]">Комментарий</th>
                     </tr>
                     <tr className="bg-slate-50/40 border-b border-slate-200">
                       <th className="pb-2 px-2">
-                        <ColTextFilter value={permFilters.name} onChange={(v) => setPermFilters({ ...permFilters, name: v })} />
+                        <ColTextFilter
+                          value={permFilters.name}
+                          onChange={(v) => setPermFilters({ ...permFilters, name: v })}
+                        />
                       </th>
                       <th className="pb-2 px-2">
                         <ColSelectFilter
                           value={permFilters.status}
-                          options={['отправили на согласование', 'одобрен', 'требует исправления']}
+                          options={PERMISSION_STATUS_OPTIONS}
                           onChange={(v) => setPermFilters({ ...permFilters, status: v })}
                         />
                       </th>
                       <th className="pb-2 px-2">
-                        <ColTextFilter value={permFilters.date} onChange={(v) => setPermFilters({ ...permFilters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                        <ColTextFilter
+                          value={permFilters.date}
+                          onChange={(v) => setPermFilters({ ...permFilters, date: v })}
+                          placeholder="ДД/ММ/ГГГГ"
+                        />
+                      </th>
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={permFilters.comment}
+                          onChange={(v) => setPermFilters({ ...permFilters, comment: v })}
+                          placeholder="Заметка..."
+                        />
                       </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {projectData.permissions
-                      .filter(
-                        (p: any) =>
-                          (!permFilters.name || (p.name || '').toLowerCase().includes(permFilters.name.toLowerCase())) &&
-                          matchStatusFilter(p.status, permFilters.status) &&
-                          matchDateFilter(p.date, permFilters.date)
-                      )
-                      .map((p: any) => {
-                        const i = projectData.permissions.findIndex((item: any) => item.name === p.name);
+                    {projectData.permissions.map((p: any, idx: number) => {
+                      const hasPermFilter = Object.values(permFilters).some(Boolean);
+                      if (p.isGroup) {
+                        if (hasPermFilter) return null;
                         return (
-                          <tr key={i} className="hover:bg-slate-50/70">
-                            <td className="p-3 font-medium text-slate-700">{p.name}</td>
-                            <td className="p-2">
-                              <StatusPill
-                                value={p.status}
-                                options={['отправили на согласование', 'одобрен', 'требует исправления']}
-                                onChange={(val) => {
-                                  const arr = [...projectData.permissions];
-                                  arr[i].status = val;
-                                  updateField('permissions', arr);
-                                }}
-                              />
-                            </td>
-                            <td className="p-2">
-                              <DateInput
-                                value={p.date}
-                                onChange={(val) => {
-                                  const arr = [...projectData.permissions];
-                                  arr[i].date = val;
-                                  updateField('permissions', arr);
-                                }}
-                              />
+                          <tr key={idx} className="bg-slate-100/80">
+                            <td colSpan={4} className="py-2 px-3 font-bold text-xs text-slate-700">
+                              {p.name}
                             </td>
                           </tr>
                         );
-                      })}
+                      }
+
+                      const matches =
+                        (!permFilters.name || p.name.toLowerCase().includes(permFilters.name.toLowerCase())) &&
+                        matchStatusFilter(p.status, permFilters.status) &&
+                        matchDateFilter(p.date, permFilters.date) &&
+                        (!permFilters.comment || (p.comment || '').toLowerCase().includes(permFilters.comment.toLowerCase()));
+
+                      if (!matches) return null;
+
+                      return (
+                        <tr key={idx} className="hover:bg-slate-50/70 align-top">
+                          <td
+                            className={`p-2 font-medium text-slate-700 text-xs ${
+                              p.indent ? 'pl-6 text-slate-600' : ''
+                            }`}
+                          >
+                            {p.name}
+                          </td>
+                          <td className="p-2">
+                            <StatusPill
+                              value={p.status}
+                              options={PERMISSION_STATUS_OPTIONS}
+                              onChange={(val) => {
+                                const arr = [...projectData.permissions];
+                                arr[idx].status = val;
+                                if (val && !arr[idx].date && val !== 'не требуется') {
+                                  arr[idx].date = getTodayDMY();
+                                }
+                                updateField('permissions', arr);
+                              }}
+                            />
+                          </td>
+                          <td className="p-2">
+                            <DateInput
+                              value={p.date}
+                              onChange={(val) => {
+                                const arr = [...projectData.permissions];
+                                arr[idx].date = val;
+                                updateField('permissions', arr);
+                              }}
+                            />
+                          </td>
+                          <td className="p-2">
+                            <AutoTextarea
+                              value={p.comment || ''}
+                              onChange={(val) => {
+                                const arr = [...projectData.permissions];
+                                arr[idx].comment = val;
+                                updateField('permissions', arr);
+                              }}
+                              placeholder="Комментарий..."
+                              className="text-xs text-slate-600"
+                            />
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
 
               <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
                 <div className="p-4 border-b border-slate-100 flex justify-between items-center">
-                  <h3 className="font-semibold text-slate-800">Входящие исходные файлы</h3>
+                  <h3 className="font-semibold text-slate-800">Исходные файлы и смежники</h3>
                   {Object.values(fileFilters).some(Boolean) && (
                     <button
-                      onClick={() => setFileFilters({ name: '', status: '', date: '' })}
+                      onClick={() => setFileFilters({ name: '', status: '', date: '', comment: '' })}
                       className="text-xs text-rose-600 hover:underline"
                     >
                       Сбросить
@@ -5766,84 +6564,130 @@ function TabProjectStatus({
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
                     <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                      <th className="pt-2.5 pb-1.5 px-3">Документ</th>
-                      <th className="pt-2.5 pb-1.5 px-3 w-44">Наличие</th>
-                      <th className="pt-2.5 pb-1.5 px-3 w-36">Дата</th>
+                      <th className="pt-2.5 pb-1.5 px-3">Раздел / Файл</th>
+                      <th className="pt-2.5 pb-1.5 px-2 w-40">Статус</th>
+                      <th className="pt-2.5 pb-1.5 px-2 w-32">Дата</th>
+                      <th className="pt-2.5 pb-1.5 px-2 min-w-[140px]">Комментарий</th>
                     </tr>
                     <tr className="bg-slate-50/40 border-b border-slate-200">
                       <th className="pb-2 px-2">
-                        <ColTextFilter value={fileFilters.name} onChange={(v) => setFileFilters({ ...fileFilters, name: v })} />
+                        <ColTextFilter
+                          value={fileFilters.name}
+                          onChange={(v) => setFileFilters({ ...fileFilters, name: v })}
+                        />
                       </th>
                       <th className="pb-2 px-2">
                         <ColSelectFilter
                           value={fileFilters.status}
-                          options={['есть', 'нет', 'запросили']}
+                          options={['есть', 'запросили', 'нет', 'не требуется']}
                           onChange={(v) => setFileFilters({ ...fileFilters, status: v })}
                         />
                       </th>
                       <th className="pb-2 px-2">
-                        <ColTextFilter value={fileFilters.date} onChange={(v) => setFileFilters({ ...fileFilters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                        <ColTextFilter
+                          value={fileFilters.date}
+                          onChange={(v) => setFileFilters({ ...fileFilters, date: v })}
+                          placeholder="ДД/ММ/ГГГГ"
+                        />
+                      </th>
+                      <th className="pb-2 px-2">
+                        <ColTextFilter
+                          value={fileFilters.comment}
+                          onChange={(v) => setFileFilters({ ...fileFilters, comment: v })}
+                          placeholder="Заметка..."
+                        />
                       </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {projectData.files
-                      .filter(
-                        (f: any) =>
-                          (!fileFilters.name || (f.name || '').toLowerCase().includes(fileFilters.name.toLowerCase())) &&
-                          matchStatusFilter(f.status, fileFilters.status) &&
-                          matchDateFilter(f.date, fileFilters.date)
-                      )
-                      .map((f: any) => {
-                        const i = projectData.files.findIndex((item: any) => item.name === f.name);
-                        return (
-                          <tr key={i} className="hover:bg-slate-50/70">
-                            <td className="p-3 font-medium text-slate-700">{f.name}</td>
-                            <td className="p-2">
-                              <StatusPill
-                                value={f.status}
-                                options={['есть', 'нет', 'запросили']}
-                                onChange={(val) => {
-                                  const arr = [...projectData.files];
-                                  arr[i].status = val;
-                                  updateField('files', arr);
-                                }}
-                              />
-                            </td>
-                            <td className="p-2">
-                              <DateInput
-                                value={f.date}
-                                onChange={(val) => {
-                                  const arr = [...projectData.files];
-                                  arr[i].date = val;
-                                  updateField('files', arr);
-                                }}
-                              />
-                            </td>
-                          </tr>
-                        );
-                      })}
+                    {projectData.files.map((f: any, idx: number) => {
+                      const matches =
+                        (!fileFilters.name || f.name.toLowerCase().includes(fileFilters.name.toLowerCase())) &&
+                        matchStatusFilter(f.status, fileFilters.status) &&
+                        matchDateFilter(f.date, fileFilters.date) &&
+                        (!fileFilters.comment || (f.comment || '').toLowerCase().includes(fileFilters.comment.toLowerCase()));
+                      if (!matches) return null;
+                      return (
+                        <tr key={idx} className="hover:bg-slate-50/70 align-top">
+                          <td className="p-2.5 font-medium text-slate-700 text-xs">{f.name}</td>
+                          <td className="p-2">
+                            <StatusPill
+                              value={f.status}
+                              options={['есть', 'запросили', 'нет', 'не требуется']}
+                              onChange={(val) => {
+                                const arr = [...projectData.files];
+                                arr[idx].status = val;
+                                if (val && !arr[idx].date && val !== 'не требуется') {
+                                  arr[idx].date = getTodayDMY();
+                                }
+                                updateField('files', arr);
+                              }}
+                            />
+                          </td>
+                          <td className="p-2">
+                            <DateInput
+                              value={f.date}
+                              onChange={(val) => {
+                                const arr = [...projectData.files];
+                                arr[idx].date = val;
+                                updateField('files', arr);
+                              }}
+                            />
+                          </td>
+                          <td className="p-2">
+                            <AutoTextarea
+                              value={f.comment || ''}
+                              onChange={(val) => {
+                                const arr = [...projectData.files];
+                                arr[idx].comment = val;
+                                updateField('files', arr);
+                              }}
+                              placeholder="Комментарий..."
+                              className="text-xs text-slate-600"
+                            />
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
             </div>
           )}
 
-          {/* РАЗДЕЛ 5: СВЯЗАННЫЕ ВСТРЕЧИ И БЫСТРЫЕ ЗАДАЧИ */}
+          {/* РАЗДЕЛ 5: ВСТРЕЧИ И БЫСТРЫЕ ЗАДАЧИ ПО ПРОЕКТУ */}
           {subTab === 'related' && (
             <div className="space-y-6">
               <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
-                <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
+                <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-2">
                   <div>
                     <h3 className="font-semibold text-slate-800">
-                      Встречи по проекту {projectData.num} ({projectMeetings.length})
+                      Протоколы встреч по проекту {projectData.num} ({projectMeetings.length})
                     </h3>
-                    <p className="text-xs text-slate-400">
-                      Редактируется напрямую — изменения синхронизируются со вкладкой «Встречи» и главной страницей
+                    <p className="text-xs text-slate-500">
+                      Все изменения синхронизируются с общей вкладкой «Встречи»
                     </p>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {Object.values(relMeetingFilters).some(Boolean) && (
+                      <button
+                        onClick={() =>
+                          setRelMeetingFilters({
+                            date: '',
+                            dueDate: '',
+                            desc: '',
+                            fix: '',
+                            status: '',
+                            comment: '',
+                          })
+                        }
+                        className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg flex items-center gap-1"
+                      >
+                        <RotateCcw size={13} /> Сбросить
+                      </button>
+                    )}
                     <button
+                      type="button"
                       onClick={() =>
                         setMeetings([
                           {
@@ -5856,78 +6700,100 @@ function TabProjectStatus({
                             screenshot: [],
                             status: 'в работе',
                             comment: '',
+                            todayPlan: false,
                           },
                           ...meetings,
                         ])
                       }
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 shadow-xs"
                     >
-                      <Plus size={14} /> Запись встречи
+                      <Plus size={14} /> Добавить встречу
                     </button>
                     <button
                       onClick={() => onNavigateWithFilter(1, projectData.num)}
-                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 flex items-center gap-1 bg-indigo-50 px-3 py-1.5 rounded-lg"
+                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-lg flex items-center gap-1 transition-colors"
                     >
-                      Открыть во вкладке <ArrowUpRight size={14} />
+                      В общий список <ArrowUpRight size={14} />
                     </button>
                   </div>
                 </div>
-
-                {projectMeetings.length === 0 ? (
-                  <p className="p-8 text-center text-sm text-slate-400">
-                    Для проекта {projectData.num} записей встреч пока нет.
-                  </p>
-                ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left border-collapse text-sm">
-                      <thead>
-                        <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                          <th className="pt-2.5 pb-1.5 px-2 w-36">Дата встречи</th>
-                          <th className="pt-2.5 pb-1.5 px-2 w-36">На когда</th>
-                          <th className="pt-2.5 pb-1.5 px-2 min-w-[200px]">Описание вопроса</th>
-                          <th className="pt-2.5 pb-1.5 px-2 min-w-[200px]">Что исправить</th>
-                          <th className="pt-2.5 pb-1.5 px-2 w-44 text-center">Скриншоты</th>
-                          <th className="pt-2.5 pb-1.5 px-2 w-44">Статус</th>
-                          <th className="pt-2.5 pb-1.5 px-2 min-w-[160px]">Комментарий</th>
-                          <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-sm">
+                    <thead>
+                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дата встречи</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-36">На когда</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Описание вопроса</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Что исправить</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-44 text-center">Скриншоты</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-44">Статус</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[160px]">Комментарий</th>
+                        <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
+                      </tr>
+                      <tr className="bg-slate-50/40 border-b border-slate-200">
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relMeetingFilters.date}
+                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, date: v })}
+                            placeholder="ДД/ММ/ГГГГ"
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relMeetingFilters.dueDate}
+                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, dueDate: v })}
+                            placeholder="ДД/ММ/ГГГГ"
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relMeetingFilters.desc}
+                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, desc: v })}
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relMeetingFilters.fix}
+                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, fix: v })}
+                          />
+                        </th>
+                        <th className="pb-2 px-2"></th>
+                        <th className="pb-2 px-2">
+                          <ColSelectFilter
+                            value={relMeetingFilters.status}
+                            options={['в работе', 'исправлено', 'на паузе', 'передано другому']}
+                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, status: v })}
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relMeetingFilters.comment}
+                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, comment: v })}
+                          />
+                        </th>
+                        <th className="pb-2 px-2"></th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {projectMeetings.length === 0 ? (
+                        <tr>
+                          <td colSpan={8} className="py-8 text-center text-slate-400">
+                            По этому проекту пока нет записей встреч.
+                          </td>
                         </tr>
-                        <tr className="bg-slate-50/40 border-b border-slate-200">
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relMeetingFilters.date} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, date: v })} placeholder="ДД/ММ/ГГГГ" />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relMeetingFilters.dueDate} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, dueDate: v })} placeholder="ДД/ММ/ГГГГ" />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relMeetingFilters.desc} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, desc: v })} />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relMeetingFilters.fix} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, fix: v })} />
-                          </th>
-                          <th className="pb-2 px-1.5"></th>
-                          <th className="pb-2 px-1.5">
-                            <ColSelectFilter
-                              value={relMeetingFilters.status}
-                              options={['в работе', 'исправлено', 'на паузе', 'передано другому']}
-                              onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, status: v })}
-                            />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relMeetingFilters.comment} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, comment: v })} />
-                          </th>
-                          <th className="pb-2 px-1.5"></th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100">
-                        {projectMeetings
+                      ) : (
+                        projectMeetings
                           .filter(
                             (m: any) =>
                               matchDateFilter(m.date, relMeetingFilters.date) &&
                               matchDateFilter(m.dueDate, relMeetingFilters.dueDate) &&
-                              (!relMeetingFilters.desc || (m.desc || '').toLowerCase().includes(relMeetingFilters.desc.toLowerCase())) &&
-                              (!relMeetingFilters.fix || (m.fix || '').toLowerCase().includes(relMeetingFilters.fix.toLowerCase())) &&
+                              (!relMeetingFilters.desc ||
+                                (m.desc || '').toLowerCase().includes(relMeetingFilters.desc.toLowerCase())) &&
+                              (!relMeetingFilters.fix ||
+                                (m.fix || '').toLowerCase().includes(relMeetingFilters.fix.toLowerCase())) &&
                               matchStatusFilter(m.status, relMeetingFilters.status) &&
-                              (!relMeetingFilters.comment || (m.comment || '').toLowerCase().includes(relMeetingFilters.comment.toLowerCase()))
+                              (!relMeetingFilters.comment ||
+                                (m.comment || '').toLowerCase().includes(relMeetingFilters.comment.toLowerCase()))
                           )
                           .map((m: any) => (
                             <tr
@@ -5936,17 +6802,22 @@ function TabProjectStatus({
                               className="group hover:bg-slate-50/70 align-top"
                             >
                               <td className="p-2">
-                                <DateInput value={m.date} onChange={(val) => updateMeetingRow(m.id, 'date', val)} />
+                                <DateInput
+                                  value={m.date}
+                                  onChange={(val) => updateMeetingRow(m.id, 'date', val)}
+                                />
                               </td>
                               <td className="p-2">
-                                <DateInput value={m.dueDate || ''} onChange={(val) => updateMeetingRow(m.id, 'dueDate', val)} />
+                                <DateInput
+                                  value={m.dueDate || ''}
+                                  onChange={(val) => updateMeetingRow(m.id, 'dueDate', val)}
+                                />
                               </td>
                               <td className="p-2">
                                 <AutoTextarea
                                   value={m.desc}
                                   onChange={(val) => updateMeetingRow(m.id, 'desc', val)}
                                   placeholder="Суть вопроса..."
-                                  className="text-xs"
                                 />
                               </td>
                               <td className="p-2">
@@ -5954,7 +6825,6 @@ function TabProjectStatus({
                                   value={m.fix}
                                   onChange={(val) => updateMeetingRow(m.id, 'fix', val)}
                                   placeholder="Что исправить..."
-                                  className="text-xs"
                                 />
                               </td>
                               <td className="p-2 text-center">
@@ -5975,134 +6845,169 @@ function TabProjectStatus({
                                 <AutoTextarea
                                   value={m.comment}
                                   onChange={(val) => updateMeetingRow(m.id, 'comment', val)}
-                                  placeholder="Комментарий..."
+                                  placeholder="Заметка..."
                                   className="text-xs text-slate-600"
                                 />
                               </td>
                               <td className="p-2 text-center">
                                 <button
-                                  onClick={() => setMeetings(meetings.filter((item: any) => item.id !== m.id))}
+                                  type="button"
+                                  onClick={() => setMeetings(meetings.filter((mtg: any) => mtg.id !== m.id))}
                                   className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
                                 >
-                                  <Trash2 size={14} />
+                                  <Trash2 size={15} />
                                 </button>
                               </td>
                             </tr>
-                          ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                          ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
               </div>
 
               <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
-                <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
+                <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-2">
                   <div>
                     <h3 className="font-semibold text-slate-800">
                       Быстрые задачи по проекту {projectData.num} ({projectQuickTasks.length})
                     </h3>
-                    <p className="text-xs text-slate-400">
-                      Редактируется напрямую — изменения синхронизируются со вкладкой «Задачи»
+                    <p className="text-xs text-slate-500">
+                      Все изменения синхронизируются со вкладкой «Задачи»
                     </p>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {Object.values(relTaskFilters).some(Boolean) && (
+                      <button
+                        onClick={() =>
+                          setRelTaskFilters({ date: '', desc: '', estDate: '', status: '', comment: '' })
+                        }
+                        className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg flex items-center gap-1"
+                      >
+                        <RotateCcw size={13} /> Сбросить
+                      </button>
+                    )}
                     <button
+                      type="button"
                       onClick={() =>
                         setTasks([
                           {
                             id: Date.now(),
+                            num: tasks.length + 1,
                             date: getTodayDMY(),
                             project: projectData.num,
                             desc: '',
                             estDate: '',
-                            status: 'в работе',
+                            status: 'не выполнена',
                             comment: '',
                           },
                           ...tasks,
                         ])
                       }
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 shadow-xs"
                     >
-                      <Plus size={14} /> Быстрая задача
+                      <Plus size={14} /> Добавить задачу
                     </button>
                     <button
                       onClick={() => onNavigateWithFilter(4, projectData.num)}
-                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 flex items-center gap-1 bg-indigo-50 px-3 py-1.5 rounded-lg"
+                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 hover:bg-indigo-100 px-3 py-1.5 rounded-lg flex items-center gap-1 transition-colors"
                     >
-                      Открыть во вкладке <ArrowUpRight size={14} />
+                      В общий список <ArrowUpRight size={14} />
                     </button>
                   </div>
                 </div>
-
-                {projectQuickTasks.length === 0 ? (
-                  <p className="p-8 text-center text-sm text-slate-400">
-                    Для проекта {projectData.num} быстрых задач пока нет.
-                  </p>
-                ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left border-collapse text-sm">
-                      <thead>
-                        <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                          <th className="pt-2.5 pb-1.5 px-2 w-36">Дата</th>
-                          <th className="pt-2.5 pb-1.5 px-2 min-w-[240px]">Описание задачи</th>
-                          <th className="pt-2.5 pb-1.5 px-2 w-36">Срок</th>
-                          <th className="pt-2.5 pb-1.5 px-2 w-44">Статус</th>
-                          <th className="pt-2.5 pb-1.5 px-2 min-w-[180px]">Комментарий</th>
-                          <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-sm">
+                    <thead>
+                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дата создания</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[260px]">Описание задачи</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дедлайн</th>
+                        <th className="pt-2.5 pb-1.5 px-3 w-44">Статус</th>
+                        <th className="pt-2.5 pb-1.5 px-3 min-w-[180px]">Комментарий</th>
+                        <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
+                      </tr>
+                      <tr className="bg-slate-50/40 border-b border-slate-200">
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relTaskFilters.date}
+                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, date: v })}
+                            placeholder="ДД/ММ/ГГГГ"
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relTaskFilters.desc}
+                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, desc: v })}
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relTaskFilters.estDate}
+                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, estDate: v })}
+                            placeholder="ДД/ММ/ГГГГ"
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColSelectFilter
+                            value={relTaskFilters.status}
+                            options={['не выполнена', 'в работе', 'выполнена', 'на паузе']}
+                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, status: v })}
+                          />
+                        </th>
+                        <th className="pb-2 px-2">
+                          <ColTextFilter
+                            value={relTaskFilters.comment}
+                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, comment: v })}
+                          />
+                        </th>
+                        <th className="pb-2 px-2"></th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {projectQuickTasks.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="py-8 text-center text-slate-400">
+                            По этому проекту пока нет быстрых задач.
+                          </td>
                         </tr>
-                        <tr className="bg-slate-50/40 border-b border-slate-200">
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relTaskFilters.date} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, date: v })} placeholder="ДД/ММ/ГГГГ" />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relTaskFilters.desc} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, desc: v })} />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relTaskFilters.estDate} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, estDate: v })} placeholder="ДД/ММ/ГГГГ" />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColSelectFilter
-                              value={relTaskFilters.status}
-                              options={['в работе', 'выполнена', 'передано', 'на паузе']}
-                              onChange={(v) => setRelTaskFilters({ ...relTaskFilters, status: v })}
-                            />
-                          </th>
-                          <th className="pb-2 px-1.5">
-                            <ColTextFilter value={relTaskFilters.comment} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, comment: v })} />
-                          </th>
-                          <th className="pb-2 px-1.5"></th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-100">
-                        {projectQuickTasks
+                      ) : (
+                        projectQuickTasks
                           .filter(
                             (t: any) =>
                               matchDateFilter(t.date, relTaskFilters.date) &&
-                              (!relTaskFilters.desc || (t.desc || '').toLowerCase().includes(relTaskFilters.desc.toLowerCase())) &&
+                              (!relTaskFilters.desc ||
+                                (t.desc || '').toLowerCase().includes(relTaskFilters.desc.toLowerCase())) &&
                               matchDateFilter(t.estDate, relTaskFilters.estDate) &&
                               matchStatusFilter(t.status, relTaskFilters.status) &&
-                              (!relTaskFilters.comment || (t.comment || '').toLowerCase().includes(relTaskFilters.comment.toLowerCase()))
+                              (!relTaskFilters.comment ||
+                                (t.comment || '').toLowerCase().includes(relTaskFilters.comment.toLowerCase()))
                           )
                           .map((t: any) => (
                             <tr key={t.id} className="group hover:bg-slate-50/70 align-top">
                               <td className="p-2">
-                                <DateInput value={t.date} onChange={(val) => updateQuickTaskRow(t.id, 'date', val)} />
+                                <DateInput
+                                  value={t.date}
+                                  onChange={(val) => updateQuickTaskRow(t.id, 'date', val)}
+                                />
                               </td>
                               <td className="p-2">
                                 <AutoTextarea
                                   value={t.desc}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'desc', val)}
                                   placeholder="Описание задачи..."
-                                  className="text-xs font-medium"
                                 />
                               </td>
                               <td className="p-2">
-                                <DateInput value={t.estDate} onChange={(val) => updateQuickTaskRow(t.id, 'estDate', val)} />
+                                <DateInput
+                                  value={t.estDate}
+                                  onChange={(val) => updateQuickTaskRow(t.id, 'estDate', val)}
+                                />
                               </td>
                               <td className="p-2">
                                 <StatusPill
                                   value={t.status}
-                                  options={['в работе', 'выполнена', 'передано', 'на паузе']}
+                                  options={['не выполнена', 'в работе', 'выполнена', 'на паузе']}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'status', val)}
                                 />
                               </td>
@@ -6110,24 +7015,25 @@ function TabProjectStatus({
                                 <AutoTextarea
                                   value={t.comment}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'comment', val)}
-                                  placeholder="Примечание..."
+                                  placeholder="Заметка..."
                                   className="text-xs text-slate-600"
                                 />
                               </td>
                               <td className="p-2 text-center">
                                 <button
+                                  type="button"
                                   onClick={() => setTasks(tasks.filter((item: any) => item.id !== t.id))}
                                   className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
                                 >
-                                  <Trash2 size={14} />
+                                  <Trash2 size={15} />
                                 </button>
                               </td>
                             </tr>
-                          ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+                          ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           )}
@@ -6137,110 +7043,110 @@ function TabProjectStatus({
   );
 }
 
-// === 12. ВКЛАДКА 3: ОТЧЕТ ===
+// === 12. ВКЛАДКА 3: ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ ===
 
-function TabReport({ reportRows, setReportRows, projects }: any) {
-  const [selectedWeek, setSelectedWeek] = useState(getCurrentISOWeek());
+function TabWeeklyReport({ reports, setReports, projects }: any) {
+  const [weekFilter, setWeekFilter] = useState(getCurrentISOWeek());
   const [filters, setFilters] = useState({
-    projectNum: '',
+    project: '',
     stage: '',
     deadline: '',
     done: '',
     inProgress: '',
     blockers: '',
+    comment: '',
   });
   const [copiedWeek, setCopiedWeek] = useState(false);
 
-  const hasActiveFilters = Object.values(filters).some(Boolean);
-  const resetFilters = () =>
-    setFilters({ projectNum: '', stage: '', deadline: '', done: '', inProgress: '', blockers: '' });
+  const activeProjects = useMemo(
+    () => projects.filter((p: any) => !p.archived),
+    [projects]
+  );
 
-  const filtered = reportRows.filter(
+  const visibleReports = reports.filter(
     (r: any) =>
-      r.week === selectedWeek &&
-      (!filters.projectNum || (r.projectNum || '').toLowerCase().includes(filters.projectNum.toLowerCase())) &&
+      (!weekFilter || r.week === weekFilter) &&
+      (!filters.project || (r.project || '').toLowerCase().includes(filters.project.toLowerCase())) &&
       (!filters.stage || (r.stage || '').toLowerCase().includes(filters.stage.toLowerCase())) &&
       matchDateFilter(r.deadline, filters.deadline) &&
       (!filters.done || (r.done || '').toLowerCase().includes(filters.done.toLowerCase())) &&
       (!filters.inProgress || (r.inProgress || '').toLowerCase().includes(filters.inProgress.toLowerCase())) &&
-      (!filters.blockers || (r.blockers || '').toLowerCase().includes(filters.blockers.toLowerCase()))
+      (!filters.blockers || (r.blockers || '').toLowerCase().includes(filters.blockers.toLowerCase())) &&
+      (!filters.comment || (r.comment || '').toLowerCase().includes(filters.comment.toLowerCase()))
   );
 
-  const updateRow = (id: any, field: string, value: string) => {
-    setReportRows(reportRows.map((r: any) => (r.id === id ? { ...r, [field]: value } : r)));
+  const updateReport = (id: any, field: string, value: any) => {
+    setReports(reports.map((r: any) => (r.id === id ? { ...r, [field]: value } : r)));
   };
 
-  const handleGenerateFromProjects = () => {
-    if (!projects.length) {
-      alert('Сначала создайте хотя бы один проект во вкладке «Статус проекта».');
+  const handleAutoPopulateFromProjects = () => {
+    if (!activeProjects.length) {
+      alert('Нет активных проектов для заполнения отчета.');
       return;
     }
+    const targetWeek = weekFilter || getCurrentISOWeek();
+    const updatedList = [...reports];
+    let addedCount = 0;
+    let updatedCount = 0;
 
-    const updatedRows = [...reportRows];
-    projects.forEach((p: any, idx: number) => {
-      const summary = buildProjectReportSummary(p, selectedWeek);
-      const existingIdx = updatedRows.findIndex(
-        (r: any) => r.week === selectedWeek && (r.projectNum || '').trim() === (p.num || '').trim()
+    activeProjects.forEach((p: any, index: number) => {
+      const summary = buildProjectReportSummary(p, targetWeek);
+      const existingIdx = updatedList.findIndex(
+        (r: any) =>
+          r.week === targetWeek &&
+          (r.projectId === p.id || (r.project || '').trim() === (p.num || '').trim())
       );
 
       if (existingIdx !== -1) {
-        updatedRows[existingIdx] = {
-          ...updatedRows[existingIdx],
-          stage: summary.stage || updatedRows[existingIdx].stage || '',
-          deadline: summary.deadline || updatedRows[existingIdx].deadline || '',
+        updatedList[existingIdx] = {
+          ...updatedList[existingIdx],
+          projectId: p.id,
+          project: p.num,
+          stage: summary.stage || updatedList[existingIdx].stage,
+          deadline: summary.deadline || updatedList[existingIdx].deadline,
           done: summary.done,
-          inProgress: summary.inProgress,
+          inProgress: summary.inProgress || updatedList[existingIdx].inProgress,
           blockers: summary.blockers,
         };
+        updatedCount++;
       } else {
-        updatedRows.push({
-          id: Date.now() + idx,
-          week: selectedWeek,
-          projectNum: p.num,
+        updatedList.push({
+          id: Date.now() + index,
+          week: targetWeek,
+          projectId: p.id,
+          project: p.num,
           stage: summary.stage,
           deadline: summary.deadline,
           done: summary.done,
           inProgress: summary.inProgress,
           blockers: summary.blockers,
+          comment: '',
         });
+        addedCount++;
       }
     });
 
-    setReportRows(updatedRows);
+    setReports(updatedList);
+    alert(
+      `Отчет за ${targetWeek} актуализирован!\nДобавлено новых строк: ${addedCount}\nОбновлено существующих: ${updatedCount}`
+    );
   };
 
   const handleCopyWeeklyReport = () => {
-    const rowsToCopy = filtered;
-    if (!rowsToCopy.length) {
-      alert('Нет строк в отчете за выбранную неделю.');
-      return;
-    }
-
-    const range = getWeekRange(selectedWeek);
-    const rangeLabel = range
-      ? ` (${formatToDMY(range.start.toISOString().slice(0, 10))} — ${formatToDMY(
-          range.end.toISOString().slice(0, 10)
-        )})`
-      : '';
-
-    const header = `ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ ПО ПРОЕКТАМ — ${selectedWeek}${rangeLabel}\n\n`;
-    const body = rowsToCopy
+    const titleWeek = weekFilter || 'Все недели';
+    const header = `Еженедельный статус по проектам (${titleWeek}):\n\n`;
+    const body = visibleReports
       .map((r: any, idx: number) => {
-        const titleParts = [
-          `${idx + 1}. Проект #${r.projectNum || '—'}`,
-          r.stage ? `[Стадия: ${r.stage}]` : '',
-          r.deadline ? `[Дедлайн: ${formatToDMY(r.deadline)}]` : '',
-        ]
-          .filter(Boolean)
-          .join(' ');
+        const title = `${idx + 1}. Проект ${r.project || '—'}${r.stage ? ` [${r.stage}]` : ''}${
+          r.deadline ? ` (Дедлайн: ${formatToDMY(r.deadline)})` : ''
+        }`;
         const lines = [
-          titleParts,
-          `   • Выполнено: ${r.done || '—'}`,
-          `   • В работе: ${r.inProgress || '—'}`,
-        ];
-        if (r.blockers && r.blockers.trim()) {
-          lines.push(`   • Блокеры / Проблемы: ${r.blockers.trim()}`);
-        }
+          title,
+          r.done ? `   • Выполнено: ${r.done}` : '',
+          r.inProgress ? `   • В работе: ${r.inProgress}` : '',
+          r.blockers ? `   • Блокеры / Вопросы: ${r.blockers}` : '',
+          r.comment ? `   • Комментарий: ${r.comment}` : '',
+        ].filter(Boolean);
         return lines.join('\n');
       })
       .join('\n\n');
@@ -6250,86 +7156,98 @@ function TabReport({ reportRows, setReportRows, projects }: any) {
     setTimeout(() => setCopiedWeek(false), 2500);
   };
 
-  const weekRange = getWeekRange(selectedWeek);
+  const weekRange = getWeekRange(weekFilter);
+  const weekRangeText = weekRange
+    ? `${formatToDMY(weekRange.start.toISOString().slice(0, 10))} — ${formatToDMY(
+        weekRange.end.toISOString().slice(0, 10)
+      )}`
+    : '';
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
-        <div>
-          <h2 className="text-lg font-semibold text-slate-800">Еженедельный сводный отчет</h2>
-          <p className="text-xs text-slate-500">
-            Автоматически собирает выполненные задачи за выбранную неделю, текущие работы и активные блокеры
-          </p>
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
+        <div className="flex flex-wrap items-center gap-3">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-800">Еженедельный статус по проектам</h2>
+            {weekRangeText && (
+              <p className="text-xs text-slate-400">Период недели: {weekRangeText}</p>
+            )}
+          </div>
+          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg px-2.5 py-1">
+            <Calendar size={14} className="text-indigo-600" />
+            <input
+              type="week"
+              className="text-xs font-medium text-slate-700 bg-transparent focus:outline-none cursor-pointer"
+              value={weekFilter}
+              onChange={(e) => setWeekFilter(e.target.value)}
+            />
+            {weekFilter && (
+              <button
+                onClick={() => setWeekFilter('')}
+                className="text-slate-400 hover:text-slate-600 ml-1"
+                title="Показать все недели"
+              >
+                <X size={13} />
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg">
-            <span className="text-xs font-medium text-slate-500">Неделя:</span>
-            <input
-              type="week"
-              value={selectedWeek}
-              onChange={(e) => setSelectedWeek(e.target.value)}
-              className="text-sm font-semibold text-slate-700 bg-transparent focus:outline-none cursor-pointer"
-            />
-            {weekRange && (
-              <span className="text-[11px] text-slate-400 font-mono hidden sm:inline">
-                ({formatToDMY(weekRange.start.toISOString().slice(0, 10))}–
-                {formatToDMY(weekRange.end.toISOString().slice(0, 10))})
-              </span>
-            )}
-          </div>
-
           <button
             type="button"
-            onClick={handleGenerateFromProjects}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-colors"
-            title="Сформировать и обновить строки по всем проектам из их чек-листов за выбранную неделю"
+            onClick={handleAutoPopulateFromProjects}
+            className="bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
+            title="Собрать выполненное за выбранную неделю, активные задачи и блокеры из активных проектов"
           >
-            <RefreshCw size={14} /> Сформировать из проектов
+            <RefreshCw size={14} /> Заполнить из проектов
           </button>
 
           <button
             type="button"
             onClick={handleCopyWeeklyReport}
-            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5 transition-colors ${
               copiedWeek
                 ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                 : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
             }`}
-            title="Скопировать весь отчет за неделю в буфер обмена для руководителя"
           >
             {copiedWeek ? <Check size={14} /> : <Copy size={14} />}
-            {copiedWeek ? 'Отчет скопирован!' : 'Скопировать отчет'}
+            {copiedWeek ? 'Отчет скопирован!' : 'Копировать отчет'}
           </button>
-
-          {hasActiveFilters && (
-            <button
-              onClick={resetFilters}
-              className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg flex items-center gap-1"
-            >
-              <RotateCcw size={13} /> Сбросить
-            </button>
-          )}
 
           <button
             onClick={() =>
-              setReportRows([
-                ...reportRows,
+              exportToCSV(
+                visibleReports.map(({ id, projectId, ...rest }: any) => rest),
+                `Weekly_Report_${weekFilter || 'All'}.csv`
+              )
+            }
+            className="bg-slate-100 hover:bg-slate-200/80 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+          >
+            <Download size={14} /> CSV
+          </button>
+
+          <button
+            onClick={() =>
+              setReports([
+                ...reports,
                 {
                   id: Date.now(),
-                  week: selectedWeek,
-                  projectNum: filters.projectNum || '',
+                  week: weekFilter || getCurrentISOWeek(),
+                  project: '',
                   stage: '',
                   deadline: '',
                   done: '',
                   inProgress: '',
                   blockers: '',
+                  comment: '',
                 },
               ])
             }
-            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-sm transition-colors"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-sm"
           >
-            <Plus size={15} /> Пустая строка
+            <Plus size={15} /> Добавить проект
           </button>
         </div>
       </div>
@@ -6338,97 +7256,131 @@ function TabReport({ reportRows, setReportRows, projects }: any) {
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-sm">
             <thead>
-              <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                <th className="pt-3 pb-1.5 px-3 w-28">Проект</th>
+              <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                <th className="pt-3 pb-1.5 px-3 w-24">Проект</th>
                 <th className="pt-3 pb-1.5 px-3 w-36">Стадия</th>
-                <th className="pt-3 pb-1.5 px-3 w-36">Дедлайн</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[230px]">Выполнено за неделю</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[230px]">В работе</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[210px]">Проблемы / Блокеры</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Дедлайн этапа</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Выполнено на этой неделе</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">В работе / Далее</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[180px]">Проблемы / Блокеры</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[150px]">Комментарий</th>
                 <th className="pt-3 pb-1.5 px-2 w-10"></th>
               </tr>
               <tr className="bg-slate-50/40 border-b border-slate-200">
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.projectNum} onChange={(v) => setFilters({ ...filters, projectNum: v })} placeholder="№..." />
+                  <ColTextFilter
+                    value={filters.project}
+                    onChange={(v) => setFilters({ ...filters, project: v })}
+                    placeholder="№..."
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.stage} onChange={(v) => setFilters({ ...filters, stage: v })} placeholder="Стадия..." />
+                  <ColTextFilter
+                    value={filters.stage}
+                    onChange={(v) => setFilters({ ...filters, stage: v })}
+                    placeholder="Стадия..."
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.deadline} onChange={(v) => setFilters({ ...filters, deadline: v })} placeholder="ДД/ММ/ГГГГ" />
+                  <ColTextFilter
+                    value={filters.deadline}
+                    onChange={(v) => setFilters({ ...filters, deadline: v })}
+                    placeholder="ДД/ММ/ГГГГ"
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.done} onChange={(v) => setFilters({ ...filters, done: v })} />
+                  <ColTextFilter
+                    value={filters.done}
+                    onChange={(v) => setFilters({ ...filters, done: v })}
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.inProgress} onChange={(v) => setFilters({ ...filters, inProgress: v })} />
+                  <ColTextFilter
+                    value={filters.inProgress}
+                    onChange={(v) => setFilters({ ...filters, inProgress: v })}
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.blockers} onChange={(v) => setFilters({ ...filters, blockers: v })} />
+                  <ColTextFilter
+                    value={filters.blockers}
+                    onChange={(v) => setFilters({ ...filters, blockers: v })}
+                  />
+                </th>
+                <th className="pb-2.5 px-2">
+                  <ColTextFilter
+                    value={filters.comment}
+                    onChange={(v) => setFilters({ ...filters, comment: v })}
+                  />
                 </th>
                 <th className="pb-2.5 px-2"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filtered.length === 0 ? (
+              {visibleReports.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="py-12 text-center text-slate-400">
-                    Записей за выбранную неделю нет. Нажмите «Сформировать из проектов» или «Пустая строка».
+                  <td colSpan={8} className="py-12 text-center text-slate-400">
+                    Записей за выбранный период нет. Нажмите «Заполнить из проектов» или добавьте строку вручную.
                   </td>
                 </tr>
               ) : (
-                filtered.map((r: any) => (
+                visibleReports.map((r: any) => (
                   <tr key={r.id} className="group hover:bg-slate-50/70 align-top">
                     <td className="p-2">
                       <input
+                        className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
                         placeholder="№..."
-                        className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 focus:bg-white rounded focus:outline-none"
-                        value={r.projectNum}
-                        onChange={(e) => updateRow(r.id, 'projectNum', e.target.value)}
+                        value={r.project}
+                        onChange={(e) => updateReport(r.id, 'project', e.target.value)}
                       />
                     </td>
                     <td className="p-2">
                       <input
-                        placeholder="Стадия..."
-                        className="w-full px-2 py-1 text-xs font-medium text-slate-700 bg-transparent hover:bg-slate-100 focus:bg-white rounded focus:outline-none"
+                        className="w-full px-2 py-1 text-xs font-medium text-slate-700 bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
+                        placeholder="היתר / ביצוע..."
                         value={r.stage || ''}
-                        onChange={(e) => updateRow(r.id, 'stage', e.target.value)}
+                        onChange={(e) => updateReport(r.id, 'stage', e.target.value)}
                       />
                     </td>
                     <td className="p-2">
                       <DateInput
                         value={r.deadline || ''}
-                        onChange={(val) => updateRow(r.id, 'deadline', val)}
+                        onChange={(val) => updateReport(r.id, 'deadline', val)}
                       />
                     </td>
                     <td className="p-2">
                       <AutoTextarea
                         value={r.done}
-                        onChange={(val) => updateRow(r.id, 'done', val)}
+                        onChange={(val) => updateReport(r.id, 'done', val)}
                         placeholder="Что сделано за неделю..."
-                        className="text-xs"
                       />
                     </td>
                     <td className="p-2">
                       <AutoTextarea
                         value={r.inProgress}
-                        onChange={(val) => updateRow(r.id, 'inProgress', val)}
-                        placeholder="Текущие работы..."
-                        className="text-xs"
+                        onChange={(val) => updateReport(r.id, 'inProgress', val)}
+                        placeholder="Текущие задачи..."
                       />
                     </td>
                     <td className="p-2">
                       <AutoTextarea
                         value={r.blockers}
-                        onChange={(val) => updateRow(r.id, 'blockers', val)}
-                        placeholder="Активные блокеры..."
-                        className="text-xs text-rose-700"
+                        onChange={(val) => updateReport(r.id, 'blockers', val)}
+                        placeholder="Что тормозит работу..."
+                        className="text-rose-700"
+                      />
+                    </td>
+                    <td className="p-2">
+                      <AutoTextarea
+                        value={r.comment}
+                        onChange={(val) => updateReport(r.id, 'comment', val)}
+                        placeholder="Заметки..."
+                        className="text-xs text-slate-600"
                       />
                     </td>
                     <td className="p-2 text-center">
                       <button
-                        onClick={() => setReportRows(reportRows.filter((row: any) => row.id !== r.id))}
-                        className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                        onClick={() => setReports(reports.filter((rep: any) => rep.id !== r.id))}
+                        className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
                       >
                         <Trash2 size={15} />
                       </button>
@@ -6444,9 +7396,14 @@ function TabReport({ reportRows, setReportRows, projects }: any) {
   );
 }
 
-// === 13. ВКЛАДКА 4: ЗАДАЧИ ===
+// === 13. ВКЛАДКА 4: БЫСТРЫЕ ЗАДАЧИ ===
 
-function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilter }: any) {
+function TabTasks({
+  tasks,
+  setTasks,
+  externalProjectFilter,
+  onClearExternalFilter,
+}: any) {
   const [filters, setFilters] = useState({
     date: '',
     project: '',
@@ -6477,7 +7434,7 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
       (!filters.comment || (t.comment || '').toLowerCase().includes(filters.comment.toLowerCase()))
   );
 
-  const updateTask = (id: any, field: string, value: string) => {
+  const updateTask = (id: any, field: string, value: any) => {
     setTasks(tasks.map((t: any) => (t.id === id ? { ...t, [field]: value } : t)));
   };
 
@@ -6486,9 +7443,7 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
         <div>
           <h2 className="text-lg font-semibold text-slate-800">Оперативные задачи и поручения</h2>
-          <p className="text-xs text-slate-500">
-            Просроченные и горящие дедлайны автоматически подсвечиваются и попадают в календарь
-          </p>
+          <p className="text-xs text-slate-500">Контроль текущих поручений с подсветкой приближающихся дедлайнов</p>
         </div>
         <div className="flex items-center gap-2">
           {hasActiveFilters && (
@@ -6496,7 +7451,7 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
               onClick={resetFilters}
               className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg flex items-center gap-1"
             >
-              <RotateCcw size={13} /> Сбросить фильтры
+              <RotateCcw size={13} /> Сбросить
             </button>
           )}
           <button
@@ -6504,17 +7459,18 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
               setTasks([
                 {
                   id: Date.now(),
-                  date: filters.date || getTodayDMY(),
+                  num: tasks.length + 1,
+                  date: getTodayDMY(),
                   project: filters.project || '',
                   desc: '',
                   estDate: '',
-                  status: 'в работе',
+                  status: 'не выполнена',
                   comment: '',
                 },
                 ...tasks,
               ])
             }
-            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 shadow-sm transition-colors whitespace-nowrap"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 shadow-sm"
           >
             <Plus size={16} /> Новая задача
           </button>
@@ -6525,37 +7481,57 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-sm">
             <thead>
-              <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                <th className="pt-3 pb-1.5 px-3 w-36">Дата</th>
+              <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                <th className="pt-3 pb-1.5 px-3 w-12 text-center">№</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Дата создания</th>
                 <th className="pt-3 pb-1.5 px-3 w-28">Проект</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[260px]">Описание задачи</th>
-                <th className="pt-3 pb-1.5 px-3 w-36">Срок (Дедлайн)</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Дедлайн</th>
                 <th className="pt-3 pb-1.5 px-3 w-44">Статус</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Комментарий</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[180px]">Комментарий</th>
                 <th className="pt-3 pb-1.5 px-2 w-10"></th>
               </tr>
               <tr className="bg-slate-50/40 border-b border-slate-200">
+                <th className="pb-2.5 px-2"></th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.date} onChange={(v) => setFilters({ ...filters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                  <ColTextFilter
+                    value={filters.date}
+                    onChange={(v) => setFilters({ ...filters, date: v })}
+                    placeholder="ДД/ММ/ГГГГ"
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.project} onChange={(v) => setFilters({ ...filters, project: v })} placeholder="№..." />
+                  <ColTextFilter
+                    value={filters.project}
+                    onChange={(v) => setFilters({ ...filters, project: v })}
+                    placeholder="№..."
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.desc} onChange={(v) => setFilters({ ...filters, desc: v })} />
+                  <ColTextFilter
+                    value={filters.desc}
+                    onChange={(v) => setFilters({ ...filters, desc: v })}
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.estDate} onChange={(v) => setFilters({ ...filters, estDate: v })} placeholder="ДД/ММ/ГГГГ" />
+                  <ColTextFilter
+                    value={filters.estDate}
+                    onChange={(v) => setFilters({ ...filters, estDate: v })}
+                    placeholder="ДД/ММ/ГГГГ"
+                  />
                 </th>
                 <th className="pb-2.5 px-2">
                   <ColSelectFilter
                     value={filters.status}
-                    options={['в работе', 'выполнена', 'передано', 'на паузе']}
+                    options={['не выполнена', 'в работе', 'выполнена', 'на паузе']}
                     onChange={(v) => setFilters({ ...filters, status: v })}
                   />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.comment} onChange={(v) => setFilters({ ...filters, comment: v })} />
+                  <ColTextFilter
+                    value={filters.comment}
+                    onChange={(v) => setFilters({ ...filters, comment: v })}
+                  />
                 </th>
                 <th className="pb-2.5 px-2"></th>
               </tr>
@@ -6563,33 +7539,36 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
             <tbody className="divide-y divide-slate-100">
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="py-12 text-center text-slate-400">
+                  <td colSpan={8} className="py-12 text-center text-slate-400">
                     Задач по заданным фильтрам не найдено.
                   </td>
                 </tr>
               ) : (
-                filtered.map((t: any) => {
-                  const isCompleted = ['выполнена', 'выполнено'].includes((t.status || '').toLowerCase());
-                  const urgency = !isCompleted ? getDeadlineUrgency(t.estDate) : null;
+                filtered.map((t: any, idx: number) => {
+                  const isDone = (t.status || '').toLowerCase() === 'выполнена';
+                  const urgency = !isDone ? getDeadlineUrgency(t.estDate) : null;
+                  const rowBg =
+                    urgency === 'overdue'
+                      ? 'bg-rose-50/70 hover:bg-rose-100/60'
+                      : urgency === 'soon'
+                      ? 'bg-amber-50/60 hover:bg-amber-100/50'
+                      : 'hover:bg-slate-50/70';
 
                   return (
-                    <tr
-                      key={t.id}
-                      className={`group transition-colors align-top ${
-                        urgency === 'overdue'
-                          ? 'bg-rose-50/70 hover:bg-rose-100/60'
-                          : urgency === 'soon'
-                          ? 'bg-amber-50/60 hover:bg-amber-100/50'
-                          : 'hover:bg-slate-50/70'
-                      }`}
-                    >
+                    <tr key={t.id} className={`group align-top transition-colors ${rowBg}`}>
+                      <td className="p-2.5 text-center font-mono text-xs text-slate-400">
+                        {idx + 1}
+                      </td>
                       <td className="p-2">
-                        <DateInput value={t.date} onChange={(val) => updateTask(t.id, 'date', val)} />
+                        <DateInput
+                          value={t.date}
+                          onChange={(val) => updateTask(t.id, 'date', val)}
+                        />
                       </td>
                       <td className="p-2">
                         <input
+                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100/70 focus:bg-white rounded focus:outline-none"
                           placeholder="№..."
-                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 focus:bg-white rounded focus:outline-none"
                           value={t.project}
                           onChange={(e) => updateTask(t.id, 'project', e.target.value)}
                         />
@@ -6599,16 +7578,26 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
                           value={t.desc}
                           onChange={(val) => updateTask(t.id, 'desc', val)}
                           placeholder="Что нужно сделать..."
-                          className="font-medium"
+                          className={isDone ? 'line-through text-slate-400' : ''}
                         />
                       </td>
                       <td className="p-2">
-                        <DateInput value={t.estDate} onChange={(val) => updateTask(t.id, 'estDate', val)} />
+                        <DateInput
+                          value={t.estDate}
+                          onChange={(val) => updateTask(t.id, 'estDate', val)}
+                          className={
+                            urgency === 'overdue'
+                              ? 'text-rose-700 font-bold'
+                              : urgency === 'soon'
+                              ? 'text-amber-800 font-semibold'
+                              : ''
+                          }
+                        />
                       </td>
                       <td className="p-2">
                         <StatusPill
                           value={t.status}
-                          options={['в работе', 'выполнена', 'передано', 'на паузе']}
+                          options={['не выполнена', 'в работе', 'выполнена', 'на паузе']}
                           onChange={(val) => updateTask(t.id, 'status', val)}
                         />
                       </td>
@@ -6616,14 +7605,14 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
                         <AutoTextarea
                           value={t.comment}
                           onChange={(val) => updateTask(t.id, 'comment', val)}
-                          placeholder="Примечание..."
-                          className="text-slate-600 text-xs"
+                          placeholder="Заметка..."
+                          className="text-xs text-slate-600"
                         />
                       </td>
                       <td className="p-2 text-center">
                         <button
-                          onClick={() => setTasks(tasks.filter((task: any) => task.id !== t.id))}
-                          className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                          onClick={() => setTasks(tasks.filter((item: any) => item.id !== t.id))}
+                          className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
                         >
                           <Trash2 size={15} />
                         </button>
@@ -6640,514 +7629,564 @@ function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilte
   );
 }
 
-// === 14. ГЛАВНЫЙ КОМПОНЕНТ ПРИЛОЖЕНИЯ (С GOOGLE DRIVE СИНХРОНИЗАЦИЕЙ) ===
+// === 14. ГЛАВНОЕ ПРИЛОЖЕНИЕ + СИНХРОНИЗАЦИЯ С GOOGLE ДИСКОМ + ЗАЩИТА ОТ КОНФЛИКТОВ ===
 
 export default function App() {
   const [activeTab, setActiveTab] = useState(0);
-  const [meetings, setMeetings, meetingsLoaded] = useIndexedStorage<any[]>('sup_meetings_v2', []);
-  const [projects, setProjects, projectsLoaded] = useIndexedStorage<any[]>('sup_projects_v2', []);
-  const [activeProjectId, setActiveProjectId, activeProjLoaded] = useIndexedStorage<string | null>(
-    'sup_active_proj_v2',
-    null
-  );
-  const [reportRows, setReportRows, reportLoaded] = useIndexedStorage<any[]>('sup_report_v2', []);
-  const [tasks, setTasks, tasksLoaded] = useIndexedStorage<any[]>('sup_tasks_v2', []);
-  const [calendarEvents, setCalendarEvents, calendarLoaded] = useIndexedStorage<any[]>(
-    'sup_calendar_events_v1',
-    []
-  );
 
-  // Состояние Google Drive синхронизации
-  const [driveToken, setDriveToken] = useState<string | null>(() => {
-    try {
-      const saved = sessionStorage.getItem('sup_gdrive_token');
-      const exp = Number(sessionStorage.getItem('sup_gdrive_exp') || 0);
-      if (saved && exp > Date.now() + 30000) return saved;
-    } catch {
-      // ignore
-    }
-    return null;
-  });
-  const [driveSyncStatus, setDriveSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
-  const [lastDriveSyncTime, setLastDriveSyncTime] = useState<string | null>(null);
-  const [driveErrorMsg, setDriveErrorMsg] = useState<string | null>(null);
-  const driveFileIdRef = useRef<string | null>(null);
-  const skipNextAutoUploadRef = useRef<boolean>(false);
+  const [projects, setProjects, projectsLoaded] = useIndexedStorage<any[]>('sup_projects_v2', []);
+  const [meetings, setMeetings, meetingsLoaded] = useIndexedStorage<any[]>('sup_meetings_v2', []);
+  const [reports, setReports, reportsLoaded] = useIndexedStorage<any[]>('sup_reports_v2', []);
+  const [tasks, setTasks, tasksLoaded] = useIndexedStorage<any[]>('sup_tasks_v2', []);
+  const [calendarEvents, setCalendarEvents, calendarLoaded] = useIndexedStorage<any[]>('sup_calendar_events_v1', []);
+  const [activeProjectId, setActiveProjectId, activeProjLoaded] = useIndexedStorage<string>('sup_active_project_id_v2', '');
+
+  const isStorageReady =
+    projectsLoaded && meetingsLoaded && reportsLoaded && tasksLoaded && calendarLoaded && activeProjLoaded;
+
+  const [externalProjectFilter, setExternalProjectFilter] = useState('');
+  const [externalProjectSubTab, setExternalProjectSubTab] = useState<
+    'tasks' | 'remarks' | 'revisions' | 'docs' | 'related' | undefined
+  >(undefined);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
 
   const [lightboxState, setLightboxState] = useState<{
     images: string[];
-    index: number;
+    initialIndex: number;
     onSaveEdited?: (idx: number, newUrl: string) => void;
   } | null>(null);
 
-  const [isSearchOpen, setIsSearchOpen] = useState(false);
-  const [externalProjectFilter, setExternalProjectFilter] = useState('');
-  const [externalProjectSubTab, setExternalProjectSubTab] = useState<
-    'tasks' | 'remarks' | 'revisions' | 'docs' | 'related' | null
-  >(null);
-  const [syncToast, setSyncToast] = useState<string | null>(null);
-  const [dueAlarmToast, setDueAlarmToast] = useState<any | null>(null);
   const [notifPermission, setNotifPermission] = useState<string>(() =>
-    typeof Notification !== 'undefined' ? Notification.permission : 'default'
+    typeof Notification !== 'undefined' ? Notification.permission : 'denied'
   );
+  const [activeAlertBanner, setActiveAlertBanner] = useState<string | null>(null);
 
-  const allLoaded =
-    meetingsLoaded &&
-    projectsLoaded &&
-    activeProjLoaded &&
-    reportLoaded &&
-    tasksLoaded &&
-    calendarLoaded;
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const showToast = useCallback((msg: string) => {
-    setSyncToast(msg);
-    setTimeout(() => setSyncToast(null), 3500);
-  }, []);
+  // === СОСТОЯНИЕ GOOGLE DRIVE SYNC + ЗАЩИТА ОТ КОНФЛИКТОВ ===
+  const [gdriveToken, setGdriveToken] = useState<string | null>(null);
+  const [gdriveFileId, setGdriveFileId] = useState<string | null>(null);
+  const [gdriveModifiedTime, setGdriveModifiedTime] = useState<string | null>(null);
+  const [gdriveConflictTime, setGdriveConflictTime] = useState<string | null>(null);
+  const [gdriveStatus, setGdriveStatus] = useState<'disconnected' | 'syncing' | 'synced' | 'conflict' | 'error'>('disconnected');
+  const [gdriveLastSync, setGdriveLastSync] = useState<string>('');
+  const [gdriveErrorMsg, setGdriveErrorMsg] = useState<string>('');
+  const tokenClientRef = useRef<any>(null);
+  const isRemoteApplyingRef = useRef(false);
 
-  // Загрузка скрипта Google Identity Services
   useEffect(() => {
-    if (document.getElementById('google-gsi-script')) return;
+    const existingScript = document.getElementById('google-gsi-client');
+    if (existingScript) return;
     const script = document.createElement('script');
-    script.id = 'google-gsi-script';
+    script.id = 'google-gsi-client';
     script.src = 'https://accounts.google.com/gsi/client';
     script.async = true;
     script.defer = true;
     document.body.appendChild(script);
   }, []);
 
-  // Поиск или создание файла базы данных в Google Drive
-  const findOrCreateDriveDbFile = useCallback(async (token: string): Promise<string> => {
-    if (driveFileIdRef.current) return driveFileIdRef.current;
-
-    const query = encodeURIComponent(
-      `name = '${CLOUD_DB_FILENAME}' and trashed = false`
-    );
-    const searchRes = await fetch(
+  const findCloudFileMeta = async (token: string): Promise<{ id: string; modifiedTime: string } | null> => {
+    const query = encodeURIComponent(`name='${CLOUD_DB_FILENAME}' and trashed=false`);
+    const res = await fetch(
       `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&spaces=drive`,
       {
         headers: { Authorization: `Bearer ${token}` },
       }
     );
-
-    if (!searchRes.ok) {
-      if (searchRes.status === 401) {
-        setDriveToken(null);
-        sessionStorage.removeItem('sup_gdrive_token');
-      }
-      throw new Error(`Ошибка доступа к Google Drive (${searchRes.status})`);
+    if (!res.ok) {
+      throw new Error(`Ошибка поиска файла на Google Диске (${res.status})`);
     }
-
-    const searchData = await searchRes.json();
-    if (searchData.files && searchData.files.length > 0) {
-      driveFileIdRef.current = searchData.files[0].id;
-      return searchData.files[0].id;
+    const data = await res.json();
+    if (data.files && data.files.length > 0) {
+      return {
+        id: data.files[0].id,
+        modifiedTime: data.files[0].modifiedTime,
+      };
     }
+    return null;
+  };
 
-    // Создаём новый файл на Google Drive
-    const createRes = await fetch(
-      'https://www.googleapis.com/drive/v3/files?fields=id',
+  const getRemoteFileModifiedTime = async (token: string, fileId: string): Promise<string | null> => {
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?fields=modifiedTime`,
       {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          name: CLOUD_DB_FILENAME,
-          mimeType: 'application/json',
-        }),
+        headers: { Authorization: `Bearer ${token}` },
       }
     );
-    if (!createRes.ok) throw new Error('Не удалось создать файл базы на Google Drive');
-    const created = await createRes.json();
-    driveFileIdRef.current = created.id;
-    return created.id;
-  }, []);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.modifiedTime || null;
+  };
 
-  // Загрузка данных С Google Drive (при входе или по кнопке)
-  const pullFromGoogleDrive = useCallback(
-    async (token: string, silent = false) => {
-      try {
-        setDriveSyncStatus('syncing');
-        setDriveErrorMsg(null);
-        const fileId = await findOrCreateDriveDbFile(token);
+  const uploadPayloadToDrive = async (
+    token: string,
+    existingFileId: string | null,
+    payloadObj: any
+  ): Promise<{ id: string; modifiedTime: string }> => {
+    const metadata = {
+      name: CLOUD_DB_FILENAME,
+      mimeType: 'application/json',
+    };
+    const boundary = '-------sup_tracker_sync_boundary_314159';
+    const delimiter = `\r\n--${boundary}\r\n`;
+    const closeDelim = `\r\n--${boundary}--`;
 
-        const downloadRes = await fetch(
-          `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
-          {
-            headers: { Authorization: `Bearer ${token}` },
-          }
-        );
+    const multipartBody =
+      delimiter +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(metadata) +
+      delimiter +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(payloadObj) +
+      closeDelim;
 
-        if (!downloadRes.ok) throw new Error('Ошибка чтения файла из Google Drive');
-        const text = await downloadRes.text();
+    const url = existingFileId
+      ? `https://www.googleapis.com/upload/drive/v3/files/${existingFileId}?uploadType=multipart&fields=id,modifiedTime`
+      : 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,modifiedTime';
 
-        if (text && text.trim()) {
-          const parsed = JSON.parse(text);
-          const hasCloudData =
-            (parsed.projects && parsed.projects.length > 0) ||
-            (parsed.meetings && parsed.meetings.length > 0) ||
-            (parsed.tasks && parsed.tasks.length > 0) ||
-            (parsed.reportRows && parsed.reportRows.length > 0) ||
-            (parsed.calendarEvents && parsed.calendarEvents.length > 0);
+    const method = existingFileId ? 'PATCH' : 'POST';
 
-          if (hasCloudData) {
-            skipNextAutoUploadRef.current = true;
-            if (parsed.meetings) setMeetings(parsed.meetings);
-            if (parsed.projects) setProjects(parsed.projects);
-            if (parsed.activeProjectId !== undefined) setActiveProjectId(parsed.activeProjectId);
-            if (parsed.reportRows) setReportRows(parsed.reportRows);
-            if (parsed.tasks) setTasks(parsed.tasks);
-            if (parsed.calendarEvents) setCalendarEvents(parsed.calendarEvents);
-            if (!silent) showToast('Данные загружены из Google Drive ✓');
-          } else {
-            // Файл в облаке пустой (только что создан) — отправляем локальные данные туда
-            await pushToGoogleDrive(token, true);
-          }
-        } else {
-          await pushToGoogleDrive(token, true);
-        }
+    const res = await fetch(url, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': `multipart/related; boundary="${boundary}"`,
+      },
+      body: multipartBody,
+    });
 
-        const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        setLastDriveSyncTime(nowTime);
-        setDriveSyncStatus('synced');
-      } catch (err: any) {
-        console.error('Drive pull error:', err);
-        setDriveSyncStatus('error');
-        setDriveErrorMsg(err?.message || 'Ошибка синхронизации');
-      }
-    },
-    [findOrCreateDriveDbFile, setMeetings, setProjects, setActiveProjectId, setReportRows, setTasks, setCalendarEvents, showToast]
-  );
-
-  // Сохранение данных НА Google Drive
-  const pushToGoogleDrive = useCallback(
-    async (token: string, silent = true) => {
-      try {
-        setDriveSyncStatus('syncing');
-        setDriveErrorMsg(null);
-        const fileId = await findOrCreateDriveDbFile(token);
-
-        const payload = JSON.stringify({
-          updatedAt: new Date().toISOString(),
-          meetings,
-          projects,
-          activeProjectId,
-          reportRows,
-          tasks,
-          calendarEvents,
-        });
-
-        const uploadRes = await fetch(
-          `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
-          {
-            method: 'PATCH',
-            headers: {
-              Authorization: `Bearer ${token}`,
-              'Content-Type': 'application/json',
-            },
-            body: payload,
-          }
-        );
-
-        if (!uploadRes.ok) {
-          if (uploadRes.status === 401) {
-            setDriveToken(null);
-            sessionStorage.removeItem('sup_gdrive_token');
-          }
-          throw new Error(`Ошибка сохранения в Drive (${uploadRes.status})`);
-        }
-
-        const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        setLastDriveSyncTime(nowTime);
-        setDriveSyncStatus('synced');
-        if (!silent) showToast('База сохранена в Google Drive ✓');
-      } catch (err: any) {
-        console.error('Drive push error:', err);
-        setDriveSyncStatus('error');
-        setDriveErrorMsg(err?.message || 'Ошибка сохранения');
-      }
-    },
-    [findOrCreateDriveDbFile, meetings, projects, activeProjectId, reportRows, tasks, calendarEvents, showToast]
-  );
-
-  // Автоматическая отправка изменений на Google Drive с задержкой 2.5 сек
-  useEffect(() => {
-    if (!driveToken || !allLoaded) return;
-    if (skipNextAutoUploadRef.current) {
-      skipNextAutoUploadRef.current = false;
-      return;
+    if (!res.ok) {
+      throw new Error(`Ошибка сохранения на Google Диск (${res.status})`);
     }
+    const data = await res.json();
+    return {
+      id: data.id,
+      modifiedTime: data.modifiedTime || new Date().toISOString(),
+    };
+  };
 
-    const timer = setTimeout(() => {
-      pushToGoogleDrive(driveToken, true);
-    }, 2500);
+  const pullLatestFromGoogleDrive = async () => {
+    if (!gdriveToken || !gdriveFileId) return;
+    try {
+      setGdriveStatus('syncing');
+      const fileRes = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${gdriveFileId}?alt=media`,
+        {
+          headers: { Authorization: `Bearer ${gdriveToken}` },
+        }
+      );
+      if (!fileRes.ok) throw new Error('Не удалось скачать файл с Google Диска');
+      const cloudData = await fileRes.json();
+      const freshModified = await getRemoteFileModifiedTime(gdriveToken, gdriveFileId);
 
-    return () => clearTimeout(timer);
-  }, [driveToken, allLoaded, meetings, projects, activeProjectId, reportRows, tasks, calendarEvents, pushToGoogleDrive]);
+      isRemoteApplyingRef.current = true;
+      if (cloudData.projects) setProjects(cloudData.projects);
+      if (cloudData.meetings) setMeetings(cloudData.meetings);
+      if (cloudData.reports) setReports(cloudData.reports);
+      if (cloudData.tasks) setTasks(cloudData.tasks);
+      if (cloudData.calendarEvents) setCalendarEvents(cloudData.calendarEvents);
+      if (cloudData.activeProjectId) setActiveProjectId(cloudData.activeProjectId);
 
-  // Авторизация в Google Drive через OAuth2 popup
+      setGdriveModifiedTime(freshModified || new Date().toISOString());
+      setGdriveConflictTime(null);
+      setGdriveStatus('synced');
+      setGdriveLastSync(
+        new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+      );
+      setTimeout(() => {
+        isRemoteApplyingRef.current = false;
+      }, 600);
+    } catch (err: any) {
+      setGdriveStatus('error');
+      setGdriveErrorMsg(err?.message || 'Ошибка загрузки с диска');
+    }
+  };
+
+  const forceOverwriteGoogleDrive = async () => {
+    if (!gdriveToken) return;
+    try {
+      setGdriveStatus('syncing');
+      const payload = {
+        projects,
+        meetings,
+        reports,
+        tasks,
+        calendarEvents,
+        activeProjectId,
+        exportedAt: new Date().toISOString(),
+      };
+      const saved = await uploadPayloadToDrive(gdriveToken, gdriveFileId, payload);
+      setGdriveFileId(saved.id);
+      setGdriveModifiedTime(saved.modifiedTime);
+      setGdriveConflictTime(null);
+      setGdriveStatus('synced');
+      setGdriveLastSync(
+        new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+      );
+    } catch (err: any) {
+      setGdriveStatus('error');
+      setGdriveErrorMsg(err?.message || 'Ошибка перезаписи');
+    }
+  };
+
   const handleConnectGoogleDrive = () => {
     const googleObj = (window as any).google;
     if (!googleObj?.accounts?.oauth2) {
-      alert('Скрипт авторизации Google еще загружается. Попробуйте через пару секунд.');
+      alert('Библиотека авторизации Google еще загружается. Попробуйте через 2 секунды.');
       return;
     }
 
-    const tokenClient = googleObj.accounts.oauth2.initTokenClient({
+    setGdriveStatus('syncing');
+    setGdriveErrorMsg('');
+
+    tokenClientRef.current = googleObj.accounts.oauth2.initTokenClient({
       client_id: GOOGLE_CLIENT_ID,
       scope: GOOGLE_DRIVE_SCOPE,
-      callback: (response: any) => {
-        if (response.error) {
-          setDriveSyncStatus('error');
-          setDriveErrorMsg(response.error_description || response.error);
+      callback: async (tokenResponse: any) => {
+        if (tokenResponse?.error) {
+          setGdriveStatus('error');
+          setGdriveErrorMsg(tokenResponse.error);
           return;
         }
-        if (response.access_token) {
-          const expiresInSec = Number(response.expires_in || 3500);
-          setDriveToken(response.access_token);
-          try {
-            sessionStorage.setItem('sup_gdrive_token', response.access_token);
-            sessionStorage.setItem('sup_gdrive_exp', String(Date.now() + expiresInSec * 1000));
-          } catch {
-            // ignore
+        const accessToken = tokenResponse.access_token;
+        setGdriveToken(accessToken);
+
+        try {
+          const existingMeta = await findCloudFileMeta(accessToken);
+          if (existingMeta) {
+            const fileRes = await fetch(
+              `https://www.googleapis.com/drive/v3/files/${existingMeta.id}?alt=media`,
+              {
+                headers: { Authorization: `Bearer ${accessToken}` },
+              }
+            );
+            if (!fileRes.ok) throw new Error('Не удалось скачать файл базы с Google Диска');
+            const cloudData = await fileRes.json();
+
+            isRemoteApplyingRef.current = true;
+            if (cloudData.projects) setProjects(cloudData.projects);
+            if (cloudData.meetings) setMeetings(cloudData.meetings);
+            if (cloudData.reports) setReports(cloudData.reports);
+            if (cloudData.tasks) setTasks(cloudData.tasks);
+            if (cloudData.calendarEvents) setCalendarEvents(cloudData.calendarEvents);
+            if (cloudData.activeProjectId) setActiveProjectId(cloudData.activeProjectId);
+
+            setGdriveFileId(existingMeta.id);
+            setGdriveModifiedTime(existingMeta.modifiedTime);
+            setGdriveConflictTime(null);
+            setGdriveStatus('synced');
+            setGdriveLastSync(
+              new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+            );
+            setTimeout(() => {
+              isRemoteApplyingRef.current = false;
+            }, 600);
+          } else {
+            const initialPayload = {
+              projects,
+              meetings,
+              reports,
+              tasks,
+              calendarEvents,
+              activeProjectId,
+              exportedAt: new Date().toISOString(),
+            };
+            const created = await uploadPayloadToDrive(accessToken, null, initialPayload);
+            setGdriveFileId(created.id);
+            setGdriveModifiedTime(created.modifiedTime);
+            setGdriveConflictTime(null);
+            setGdriveStatus('synced');
+            setGdriveLastSync(
+              new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+            );
           }
-          pullFromGoogleDrive(response.access_token, false);
+        } catch (err: any) {
+          console.error('Google Drive sync init error:', err);
+          setGdriveStatus('error');
+          setGdriveErrorMsg(err?.message || 'Ошибка синхронизации с Google Диском');
         }
       },
     });
 
-    tokenClient.requestAccessToken({ prompt: '' });
+    tokenClientRef.current.requestAccessToken({ prompt: 'consent' });
   };
 
   const handleDisconnectGoogleDrive = () => {
-    setDriveToken(null);
-    driveFileIdRef.current = null;
-    setDriveSyncStatus('idle');
-    setLastDriveSyncTime(null);
-    try {
-      sessionStorage.removeItem('sup_gdrive_token');
-      sessionStorage.removeItem('sup_gdrive_exp');
-    } catch {
-      // ignore
-    }
-    showToast('Google Drive отключён');
+    setGdriveToken(null);
+    setGdriveFileId(null);
+    setGdriveModifiedTime(null);
+    setGdriveConflictTime(null);
+    setGdriveStatus('disconnected');
+    setGdriveLastSync('');
   };
 
-  // Горячая клавиша Ctrl+K / Cmd+K для глобального поиска
+  // Автосохранение на Google Диск с предварительной проверкой modifiedTime (защита от перезаписи с другого ПК)
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
+    if (!gdriveToken || !isStorageReady || isRemoteApplyingRef.current || gdriveStatus === 'conflict') {
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      try {
+        setGdriveStatus('syncing');
+
+        if (gdriveFileId && gdriveModifiedTime) {
+          const remoteTime = await getRemoteFileModifiedTime(gdriveToken, gdriveFileId);
+          if (remoteTime && remoteTime !== gdriveModifiedTime) {
+            setGdriveConflictTime(remoteTime);
+            setGdriveStatus('conflict');
+            return;
+          }
+        }
+
+        const payload = {
+          projects,
+          meetings,
+          reports,
+          tasks,
+          calendarEvents,
+          activeProjectId,
+          exportedAt: new Date().toISOString(),
+        };
+        const saved = await uploadPayloadToDrive(gdriveToken, gdriveFileId, payload);
+        if (!gdriveFileId) setGdriveFileId(saved.id);
+        setGdriveModifiedTime(saved.modifiedTime);
+        setGdriveStatus('synced');
+        setGdriveLastSync(
+          new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+        );
+      } catch (err: any) {
+        console.error('Google Drive auto-save error:', err);
+        setGdriveStatus('error');
+        setGdriveErrorMsg('Сессия Google истекла или нет сети. Нажмите для переподключения.');
+      }
+    }, 2500);
+
+    return () => clearTimeout(timer);
+  }, [
+    projects,
+    meetings,
+    reports,
+    tasks,
+    calendarEvents,
+    activeProjectId,
+    gdriveToken,
+    gdriveFileId,
+    gdriveModifiedTime,
+    gdriveStatus,
+    isStorageReady,
+  ]);
+
+  // Автоматическое создание служебного проекта 0000 при первом запуске
+  useEffect(() => {
+    if (!isStorageReady) return;
+    setProjects((prev) => {
+      if (prev.some((p: any) => p.id === 'system_0000' || (p.num || '').trim() === '0000')) {
+        return prev;
+      }
+      return [createSystemProject0000(), ...prev];
+    });
+  }, [isStorageReady, setProjects]);
+
+  useEffect(() => {
+    if (!isStorageReady) return;
+    if (!activeProjectId && projects.length > 0) {
+      const firstActive = projects.find((p: any) => !p.archived) || projects[0];
+      setActiveProjectId(firstActive.id);
+    }
+  }, [isStorageReady, activeProjectId, projects, setActiveProjectId]);
+
+  useEffect(() => {
+    const handleGlobalKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setIsSearchOpen((prev) => !prev);
       }
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
   }, []);
-
-  // Фоновый таймер проверки напоминаний из календаря (каждые 30 секунд)
-  useEffect(() => {
-    if (!allLoaded) return;
-
-    const checkAlarms = () => {
-      const now = new Date();
-      const todayStr = getTodayDMY();
-      const currentHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(
-        now.getMinutes()
-      ).padStart(2, '0')}`;
-
-      let triggeredEvent: any = null;
-      const updated = calendarEvents.map((ev: any) => {
-        if (
-          !ev.notified &&
-          formatToDMY(ev.date) === todayStr &&
-          ev.time &&
-          ev.time <= currentHHMM
-        ) {
-          triggeredEvent = ev;
-          return { ...ev, notified: true };
-        }
-        return ev;
-      });
-
-      if (triggeredEvent) {
-        setCalendarEvents(updated);
-        setDueAlarmToast(triggeredEvent);
-        playNotificationChime();
-
-        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-          try {
-            new Notification(
-              `SUP Tracker${triggeredEvent.projectNum ? ` (#${triggeredEvent.projectNum})` : ''}`,
-              {
-                body: `${triggeredEvent.time ? `[${triggeredEvent.time}] ` : ''}${triggeredEvent.title}`,
-              }
-            );
-          } catch {
-            // ignore notification error
-          }
-        }
-      }
-    };
-
-    checkAlarms();
-    const timer = setInterval(checkAlarms, 30000);
-    return () => clearInterval(timer);
-  }, [allLoaded, calendarEvents, setCalendarEvents]);
 
   const requestDesktopNotifications = async () => {
     if (typeof Notification === 'undefined') {
       alert('Ваш браузер не поддерживает системные уведомления.');
       return;
     }
-    const res = await Notification.requestPermission();
-    setNotifPermission(res);
-    if (res === 'granted') {
-      showToast('Системные уведомления браузера включены');
+    const perm = await Notification.requestPermission();
+    setNotifPermission(perm);
+    if (perm === 'granted') {
+      playNotificationChime();
+      new Notification('ProjectStatus SUP', {
+        body: 'Системные напоминания включены! Приложение предупредит о запланированных задачах и встречах.',
+      });
     }
   };
 
-  const handleOpenProjectFromSummary = useCallback(
-    (projectId: string, subTab?: 'tasks' | 'remarks' | 'revisions' | 'docs' | 'related') => {
+  useEffect(() => {
+    if (!isStorageReady) return;
+    const checkReminders = () => {
+      const now = new Date();
+      const todayStr = getTodayDMY();
+      const currentHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(
+        now.getMinutes()
+      ).padStart(2, '0')}`;
+
+      let triggeredTitle: string | null = null;
+      let changed = false;
+
+      const updatedEvents = calendarEvents.map((ev: any) => {
+        if (ev.notified || formatToDMY(ev.date) !== todayStr) return ev;
+        const shouldTrigger = !ev.time || ev.time <= currentHHMM;
+        if (shouldTrigger) {
+          changed = true;
+          triggeredTitle = `${ev.time ? `[${ev.time}] ` : ''}${
+            ev.projectNum ? `Проект #${ev.projectNum}: ` : ''
+          }${ev.title}`;
+          return { ...ev, notified: true };
+        }
+        return ev;
+      });
+
+      if (changed && triggeredTitle) {
+        setCalendarEvents(updatedEvents);
+        setActiveAlertBanner(triggeredTitle);
+        playNotificationChime();
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          new Notification('Напоминание — ProjectStatus', { body: triggeredTitle });
+        }
+      }
+    };
+
+    checkReminders();
+    const timer = setInterval(checkReminders, 30000);
+    return () => clearInterval(timer);
+  }, [isStorageReady, calendarEvents, setCalendarEvents]);
+
+  const handleOpenProjectFromOverview = useCallback(
+    (projectId: string, targetSubTab?: 'tasks' | 'remarks' | 'revisions' | 'docs' | 'related') => {
       setActiveProjectId(projectId);
-      if (subTab) {
-        setExternalProjectSubTab(subTab);
+      if (targetSubTab) {
+        setExternalProjectSubTab(targetSubTab);
       }
       setActiveTab(2);
     },
     [setActiveProjectId]
   );
 
-  const handleNavigateWithFilter = useCallback((tabId: number, filterNum?: string) => {
-    if (filterNum !== undefined) {
-      setExternalProjectFilter(filterNum);
-    }
-    setActiveTab(tabId);
+  const handleNavigateWithFilter = useCallback((targetTab: number, projectNumber: string) => {
+    setExternalProjectFilter(projectNumber);
+    setActiveTab(targetTab);
   }, []);
 
-  const handleSyncSingleProjectToReport = (project: any) => {
+  const handleSyncSingleProjectToReport = (projectObj: any) => {
     const targetWeek = getCurrentISOWeek();
-    const summary = buildProjectReportSummary(project, targetWeek);
-    const existingIdx = reportRows.findIndex(
-      (r: any) => r.week === targetWeek && (r.projectNum || '').trim() === (project.num || '').trim()
+    const summary = buildProjectReportSummary(projectObj, targetWeek);
+    const updatedList = [...reports];
+    const existingIdx = updatedList.findIndex(
+      (r: any) =>
+        r.week === targetWeek &&
+        (r.projectId === projectObj.id || (r.project || '').trim() === (projectObj.num || '').trim())
     );
 
     if (existingIdx !== -1) {
-      const updated = [...reportRows];
-      updated[existingIdx] = {
-        ...updated[existingIdx],
-        stage: summary.stage || updated[existingIdx].stage || '',
-        deadline: summary.deadline || updated[existingIdx].deadline || '',
+      updatedList[existingIdx] = {
+        ...updatedList[existingIdx],
+        projectId: projectObj.id,
+        project: projectObj.num,
+        stage: summary.stage || updatedList[existingIdx].stage,
+        deadline: summary.deadline || updatedList[existingIdx].deadline,
+        done: summary.done,
+        inProgress: summary.inProgress || updatedList[existingIdx].inProgress,
+        blockers: summary.blockers,
+      };
+    } else {
+      updatedList.push({
+        id: Date.now(),
+        week: targetWeek,
+        projectId: projectObj.id,
+        project: projectObj.num,
+        stage: summary.stage,
+        deadline: summary.deadline,
         done: summary.done,
         inProgress: summary.inProgress,
         blockers: summary.blockers,
-      };
-      setReportRows(updated);
-    } else {
-      setReportRows([
-        ...reportRows,
-        {
-          id: Date.now(),
-          week: targetWeek,
-          projectNum: project.num,
-          stage: summary.stage,
-          deadline: summary.deadline,
-          done: summary.done,
-          inProgress: summary.inProgress,
-          blockers: summary.blockers,
-        },
-      ]);
+        comment: '',
+      });
     }
 
-    showToast(`Проект ${project.num} обновлен в отчете за ${targetWeek}`);
+    setReports(updatedList);
+    setActiveTab(3);
   };
 
-  const handleBackupSave = () => {
+  const exportBackup = () => {
     const backup = {
-      exportedAt: new Date().toISOString(),
-      meetings,
       projects,
-      activeProjectId,
-      reportRows,
+      meetings,
+      reports,
       tasks,
       calendarEvents,
+      activeProjectId,
+      exportedAt: new Date().toISOString(),
     };
     const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `SUP_Tracker_Backup_${new Date().toISOString().split('T')[0]}.json`;
+    link.download = `SUP_Tracker_Backup_${getTodayDMY().replace(/\//g, '-')}.json`;
     link.click();
   };
 
-  const handleBackupLoad = (e: any) => {
+  const importBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (event: any) => {
+    reader.onload = (ev) => {
       try {
-        const parsed = JSON.parse(event.target.result);
-        if (parsed.meetings) setMeetings(parsed.meetings);
-        if (parsed.projects) setProjects(parsed.projects);
-        if (parsed.activeProjectId !== undefined) setActiveProjectId(parsed.activeProjectId);
-        if (parsed.reportRows) setReportRows(parsed.reportRows);
-        if (parsed.tasks) setTasks(parsed.tasks);
-        if (parsed.calendarEvents) setCalendarEvents(parsed.calendarEvents);
-        showToast('Резервная копия успешно восстановлена');
+        const data = JSON.parse(ev.target?.result as string);
+        if (data.projects) setProjects(data.projects);
+        if (data.meetings) setMeetings(data.meetings);
+        if (data.reports) setReports(data.reports);
+        if (data.tasks) setTasks(data.tasks);
+        if (data.calendarEvents) setCalendarEvents(data.calendarEvents);
+        if (data.activeProjectId) setActiveProjectId(data.activeProjectId);
+        alert('База данных успешно восстановлена из файла!');
       } catch {
-        alert('Ошибка при чтении файла резервной копии.');
+        alert('Ошибка: некорректный JSON-файл резервной копии.');
       }
     };
     reader.readAsText(file);
+    e.target.value = '';
   };
 
-  const handleExportActiveTabCSV = () => {
-    if (activeTab === 1) exportToCSV(meetings, 'Meetings.csv');
-    if (activeTab === 2) {
-      const p = projects.find((item: any) => item.id === activeProjectId);
-      if (p) exportToCSV(p.tasks || [], `Project_${p.num}_Tasks.csv`);
-    }
-    if (activeTab === 3) exportToCSV(reportRows, 'Weekly_Report.csv');
-    if (activeTab === 4) exportToCSV(tasks, 'Tasks.csv');
-  };
+  const activeProjectsCount = useMemo(
+    () => projects.filter((p: any) => !p.archived).length,
+    [projects]
+  );
 
-  const tabs = [
-    { id: 0, label: 'Сводка и Календарь', icon: CalendarDays },
-    { id: 1, label: 'Встречи', icon: Users, badge: meetings.length },
-    { id: 2, label: 'Статус проекта', icon: FolderKanban, badge: projects.length },
-    { id: 3, label: 'Отчет', icon: FileSpreadsheet },
-    { id: 4, label: 'Задачи', icon: CheckSquare, badge: tasks.length },
+  const navTabs = [
+    { id: 0, label: 'Сводка и Календарь', icon: CalendarDays, count: null },
+    { id: 1, label: 'Встречи', icon: Users, count: meetings.length },
+    { id: 2, label: 'Статус проекта', icon: FolderKanban, count: activeProjectsCount },
+    { id: 3, label: 'Еженедельный отчет', icon: FileSpreadsheet, count: reports.length },
+    { id: 4, label: 'Задачи', icon: CheckSquare, count: tasks.length },
   ];
 
-  return (
-    <div className="min-h-screen bg-[#F8FAFC] text-slate-800 flex flex-col font-sans">
-      {syncToast && (
-        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4 py-2.5 rounded-xl shadow-lg text-xs font-medium flex items-center gap-2 border border-slate-700">
-          <CheckCircle2 size={16} className="text-emerald-400" />
-          {syncToast}
-        </div>
-      )}
+  if (!isStorageReady) {
+    return (
+      <div className="min-h-screen bg-slate-100/70 flex items-center justify-center text-slate-500 text-sm">
+        Загрузка базы данных проектов...
+      </div>
+    );
+  }
 
-      {dueAlarmToast && (
-        <div className="fixed top-20 right-5 z-50 bg-indigo-900 text-white p-4 rounded-2xl shadow-2xl border border-indigo-400 max-w-sm flex items-start gap-3">
-          <BellRing size={22} className="text-amber-300 shrink-0 mt-0.5" />
-          <div className="flex-grow min-w-0">
-            <div className="text-[11px] font-bold uppercase tracking-wider text-indigo-200">
-              Напоминание • {dueAlarmToast.time}
-            </div>
-            <div className="text-sm font-semibold mt-0.5">
-              {dueAlarmToast.projectNum ? `#${dueAlarmToast.projectNum} — ` : ''}
-              {dueAlarmToast.title}
-            </div>
-          </div>
-          <button
-            onClick={() => setDueAlarmToast(null)}
-            className="text-indigo-300 hover:text-white p-1"
-          >
-            <X size={16} />
-          </button>
-        </div>
-      )}
+  return (
+    <div className="min-h-screen bg-slate-100/70 text-slate-900 font-sans pb-12">
+      <style>{`
+        @media print {
+          .no-print { display: none !important; }
+          body { background: white; }
+          .shadow-sm { box-shadow: none !important; }
+        }
+      `}</style>
 
       {isSearchOpen && (
         <GlobalSearchModal
@@ -7155,265 +8194,15 @@ export default function App() {
           meetings={meetings}
           tasks={tasks}
           onClose={() => setIsSearchOpen(false)}
-          onSelectProject={handleOpenProjectFromSummary}
+          onSelectProject={handleOpenProjectFromOverview}
           onNavigateTab={handleNavigateWithFilter}
         />
       )}
 
-      <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-slate-200/80 shadow-2xs">
-        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-500 flex items-center justify-center text-white font-bold shadow-sm">
-              SUP
-            </div>
-            <div>
-              <h1 className="font-bold text-slate-900 text-base leading-tight">Project Tracker</h1>
-              <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
-                <Database size={11} className="text-emerald-500" />
-                <span>Локально (IndexedDB)</span>
-              </div>
-            </div>
-          </div>
-
-          <nav className="hidden lg:flex items-center gap-1 bg-slate-100/80 p-1 rounded-xl border border-slate-200/60">
-            {tabs.map((t) => {
-              const Icon = t.icon;
-              const isActive = activeTab === t.id;
-              return (
-                <button
-                  key={t.id}
-                  onClick={() => setActiveTab(t.id)}
-                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all ${
-                    isActive
-                      ? 'bg-white text-indigo-600 shadow-xs'
-                      : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
-                  }`}
-                >
-                  <Icon size={16} />
-                  <span>{t.label}</span>
-                  {t.badge !== undefined && t.badge > 0 && (
-                    <span
-                      className={`text-[11px] px-1.5 py-0.2 rounded-full ${
-                        isActive ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-200 text-slate-600'
-                      }`}
-                    >
-                      {t.badge}
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </nav>
-
-          <div className="flex items-center gap-1.5 sm:gap-2">
-            {/* Кнопка синхронизации с Google Drive */}
-            {!driveToken ? (
-              <button
-                type="button"
-                onClick={handleConnectGoogleDrive}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg transition-colors"
-                title="Подключить Google Drive для автоматической облачной синхронизации"
-              >
-                <CloudOff size={15} />
-                <span className="hidden sm:inline">Google Drive</span>
-              </button>
-            ) : (
-              <div className="flex items-center gap-1 bg-emerald-50/90 border border-emerald-200 px-2.5 py-1 rounded-lg text-xs">
-                <button
-                  type="button"
-                  onClick={() => pushToGoogleDrive(driveToken, false)}
-                  className="flex items-center gap-1.5 text-emerald-800 font-semibold hover:text-emerald-950"
-                  title={
-                    driveErrorMsg
-                      ? `Ошибка: ${driveErrorMsg}. Нажмите, чтобы повторить.`
-                      : `Синхронизировано с Google Drive${lastDriveSyncTime ? ` в ${lastDriveSyncTime}` : ''}. Нажмите для принудительного сохранения.`
-                  }
-                >
-                  {driveSyncStatus === 'syncing' ? (
-                    <Loader2 size={14} className="animate-spin text-indigo-600" />
-                  ) : driveSyncStatus === 'error' ? (
-                    <AlertCircle size={14} className="text-rose-600" />
-                  ) : (
-                    <Cloud size={14} className="text-emerald-600" />
-                  )}
-                  <span className="hidden md:inline">
-                    {driveSyncStatus === 'syncing'
-                      ? 'Сохранение...'
-                      : driveSyncStatus === 'error'
-                      ? 'Ошибка Drive'
-                      : `Drive${lastDriveSyncTime ? ` (${lastDriveSyncTime})` : ''}`}
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => pullFromGoogleDrive(driveToken, false)}
-                  className="p-1 text-emerald-700 hover:bg-emerald-100 rounded"
-                  title="Загрузить актуальную базу из Google Drive"
-                >
-                  <RefreshCw size={12} />
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDisconnectGoogleDrive}
-                  className="p-1 text-slate-400 hover:text-rose-600 rounded"
-                  title="Отключить Google Drive"
-                >
-                  <LogOut size={12} />
-                </button>
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setIsSearchOpen(true)}
-              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200/80 border border-slate-200/80 rounded-lg transition-colors"
-              title="Глобальный поиск по всем проектам (Ctrl + K)"
-            >
-              <Search size={14} className="text-indigo-600" />
-              <span className="hidden sm:inline">Поиск</span>
-              <kbd className="hidden md:inline-block text-[10px] px-1.5 py-0.2 bg-white border border-slate-200 rounded text-slate-400">
-                Ctrl+K
-              </kbd>
-            </button>
-
-            {notifPermission !== 'granted' && (
-              <button
-                type="button"
-                onClick={requestDesktopNotifications}
-                className="p-2 text-amber-600 hover:bg-amber-50 rounded-lg transition-colors"
-                title="Включить всплывающие уведомления браузера для напоминаний календаря"
-              >
-                <Bell size={18} />
-              </button>
-            )}
-
-            <button
-              onClick={handleBackupSave}
-              className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
-              title="Сохранить локальную резервную копию базы (.json)"
-            >
-              <Save size={18} />
-            </button>
-            <label
-              className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg cursor-pointer transition-colors"
-              title="Загрузить резервную копию (.json)"
-            >
-              <Upload size={18} />
-              <input type="file" accept=".json" onChange={handleBackupLoad} className="hidden" />
-            </label>
-            {activeTab !== 0 && (
-              <button
-                onClick={handleExportActiveTabCSV}
-                className="p-2 text-slate-500 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
-                title="Экспорт текущей вкладки в Excel (CSV)"
-              >
-                <Download size={18} />
-              </button>
-            )}
-            <button
-              onClick={() => window.print()}
-              className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors"
-              title="Печать / Сохранить в PDF"
-            >
-              <Printer size={18} />
-            </button>
-          </div>
-        </div>
-
-        <div className="flex lg:hidden border-t border-slate-100 px-3 py-1.5 gap-1 overflow-x-auto bg-slate-50/50">
-          {tabs.map((t) => {
-            const Icon = t.icon;
-            const isActive = activeTab === t.id;
-            return (
-              <button
-                key={t.id}
-                onClick={() => setActiveTab(t.id)}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap ${
-                  isActive ? 'bg-indigo-600 text-white' : 'text-slate-600 bg-white border border-slate-200/70'
-                }`}
-              >
-                <Icon size={14} />
-                {t.label}
-              </button>
-            );
-          })}
-        </div>
-      </header>
-
-      <main className="flex-grow max-w-[1600px] w-full mx-auto px-4 sm:px-6 py-6">
-        {!allLoaded ? (
-          <div className="py-20 text-center text-sm text-slate-400">
-            Загрузка локальной базы данных...
-          </div>
-        ) : (
-          <>
-            {activeTab === 0 && (
-              <TabOverviewCalendar
-                projects={projects}
-                setProjects={setProjects}
-                meetings={meetings}
-                setMeetings={setMeetings}
-                tasks={tasks}
-                calendarEvents={calendarEvents}
-                setCalendarEvents={setCalendarEvents}
-                onOpenProject={handleOpenProjectFromSummary}
-                onNavigateWithFilter={handleNavigateWithFilter}
-              />
-            )}
-            {activeTab === 1 && (
-              <TabMeetings
-                meetings={meetings}
-                setMeetings={setMeetings}
-                projects={projects}
-                onPreviewImages={(images: string[], index: number, onSaveEdited: any) =>
-                  setLightboxState({ images, index, onSaveEdited })
-                }
-                externalProjectFilter={externalProjectFilter}
-                onClearExternalFilter={() => setExternalProjectFilter('')}
-              />
-            )}
-            {activeTab === 2 && (
-              <TabProjectStatus
-                projects={projects}
-                setProjects={setProjects}
-                activeProjectId={activeProjectId}
-                setActiveProjectId={setActiveProjectId}
-                meetings={meetings}
-                setMeetings={setMeetings}
-                tasks={tasks}
-                setTasks={setTasks}
-                onNavigateWithFilter={handleNavigateWithFilter}
-                onPreviewImages={(images: string[], index: number, onSaveEdited: any) =>
-                  setLightboxState({ images, index, onSaveEdited })
-                }
-                onSyncSingleProjectToReport={handleSyncSingleProjectToReport}
-                externalSubTab={externalProjectSubTab}
-                onClearExternalSubTab={() => setExternalProjectSubTab(null)}
-              />
-            )}
-            {activeTab === 3 && (
-              <TabReport
-                reportRows={reportRows}
-                setReportRows={setReportRows}
-                projects={projects}
-              />
-            )}
-            {activeTab === 4 && (
-              <TabTasks
-                tasks={tasks}
-                setTasks={setTasks}
-                externalProjectFilter={externalProjectFilter}
-                onClearExternalFilter={() => setExternalProjectFilter('')}
-              />
-            )}
-          </>
-        )}
-      </main>
-
       {lightboxState && (
         <ScreenshotLightboxModal
           images={lightboxState.images}
-          initialIndex={lightboxState.index}
+          initialIndex={lightboxState.initialIndex}
           onClose={() => setLightboxState(null)}
           onSaveEditedImage={(idx, newUrl) => {
             if (lightboxState.onSaveEdited) {
@@ -7425,10 +8214,282 @@ export default function App() {
               nextImgs[idx] = newUrl;
               return { ...prev, images: nextImgs };
             });
-            showToast('Пометки на скриншоте сохранены ✓');
           }}
         />
       )}
+
+      {/* Баннер конфликта при работе с двух компьютеров */}
+      {gdriveStatus === 'conflict' && (
+        <div className="bg-rose-600 text-white px-4 py-3 text-xs flex flex-wrap items-center justify-between gap-3 no-print shadow-md">
+          <div className="flex items-center gap-2 font-medium">
+            <AlertTriangle size={17} className="shrink-0" />
+            <span>
+              <b>Обнаружен конфликт версий на Google Диске!</b> Файл на облаке был обновлён с другого компьютера
+              {gdriveConflictTime
+                ? ` (${new Date(gdriveConflictTime).toLocaleTimeString('ru-RU', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })})`
+                : ''}
+              . Автосохранение приостановлено, чтобы не затереть чужие изменения.
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={pullLatestFromGoogleDrive}
+              className="bg-white text-rose-700 hover:bg-rose-50 px-3 py-1 rounded-lg font-bold transition-colors"
+            >
+              Загрузить свежую с диска
+            </button>
+            <button
+              type="button"
+              onClick={forceOverwriteGoogleDrive}
+              className="bg-rose-800 hover:bg-rose-900 text-white border border-rose-400 px-3 py-1 rounded-lg font-semibold transition-colors"
+            >
+              Перезаписать своими данными
+            </button>
+          </div>
+        </div>
+      )}
+
+      {activeAlertBanner && (
+        <div className="bg-indigo-600 text-white px-4 py-2.5 text-xs flex items-center justify-between gap-3 no-print">
+          <div className="flex items-center gap-2 font-medium">
+            <BellRing size={16} className="animate-bounce shrink-0" />
+            <span>Напоминание: {activeAlertBanner}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActiveAlertBanner(null)}
+            className="bg-white/20 hover:bg-white/30 px-2.5 py-1 rounded text-[11px] font-semibold"
+          >
+            Понятно
+          </button>
+        </div>
+      )}
+
+      <header className="bg-white border-b border-slate-200/80 sticky top-0 z-30 no-print">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6">
+          <div className="flex flex-wrap justify-between items-center py-3 gap-3">
+            <div className="flex items-center gap-2.5">
+              <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center shadow-sm">
+                <Layers size={20} />
+              </div>
+              <div>
+                <h1 className="text-base font-bold text-slate-900 leading-tight">ProjectStatus</h1>
+                <p className="text-[11px] text-slate-400 font-medium flex items-center gap-1">
+                  <Database size={10} /> Локально (IndexedDB) + Облако Google Диск
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {/* КНОПКА СИНХРОНИЗАЦИИ С GOOGLE ДИСКОМ */}
+              {gdriveStatus === 'disconnected' ? (
+                <button
+                  type="button"
+                  onClick={handleConnectGoogleDrive}
+                  className="bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                  title="Подключить Google Диск для синхронизации между рабочим и домашним ПК"
+                >
+                  <CloudOff size={14} className="text-sky-600" /> Подключить Google Диск
+                </button>
+              ) : (
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={handleConnectGoogleDrive}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold border flex items-center gap-1.5 transition-colors ${
+                      gdriveStatus === 'conflict'
+                        ? 'bg-rose-100 text-rose-800 border-rose-300'
+                        : gdriveStatus === 'error'
+                        ? 'bg-rose-50 text-rose-700 border-rose-200'
+                        : gdriveStatus === 'syncing'
+                        ? 'bg-amber-50 text-amber-800 border-amber-200'
+                        : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                    }`}
+                    title={
+                      gdriveStatus === 'conflict'
+                        ? 'Обнаружен конфликт версий с другим компьютером'
+                        : gdriveErrorMsg ||
+                          `Файл на Google Диске: ${CLOUD_DB_FILENAME}. Нажмите для принудительного обновления.`
+                    }
+                  >
+                    {gdriveStatus === 'syncing' ? (
+                      <Loader2 size={14} className="animate-spin" />
+                    ) : gdriveStatus === 'conflict' ? (
+                      <AlertTriangle size={14} className="text-rose-600" />
+                    ) : (
+                      <Cloud size={14} className="text-emerald-600" />
+                    )}
+                    {gdriveStatus === 'syncing'
+                      ? 'Синхронизация...'
+                      : gdriveStatus === 'conflict'
+                      ? 'Конфликт версий!'
+                      : gdriveStatus === 'error'
+                      ? 'Ошибка Google Диска'
+                      : `Google Диск ✓ ${gdriveLastSync ? `(${gdriveLastSync})` : ''}`}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDisconnectGoogleDrive}
+                    className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
+                    title="Отключить облачную синхронизацию"
+                  >
+                    <LogOut size={13} />
+                  </button>
+                </div>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setIsSearchOpen(true)}
+                className="bg-slate-100 hover:bg-slate-200/80 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
+                title="Быстрый поиск по всем проектам, встречам и замечаниям"
+              >
+                <Search size={14} className="text-indigo-600" />
+                <span className="hidden sm:inline">Поиск</span>
+                <kbd className="text-[10px] bg-white px-1.5 py-0.2 rounded border border-slate-200 text-slate-400">
+                  Ctrl+K
+                </kbd>
+              </button>
+
+              {notifPermission !== 'granted' && (
+                <button
+                  type="button"
+                  onClick={requestDesktopNotifications}
+                  className="text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 border border-amber-200 px-2.5 py-1.5 rounded-lg flex items-center gap-1 transition-colors"
+                  title="Разрешить звуковые и системные уведомления о событиях в календаре"
+                >
+                  <Bell size={14} /> <span className="hidden md:inline">Напоминания</span>
+                </button>
+              )}
+
+              <button
+                onClick={exportBackup}
+                className="text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors"
+                title="Скачать резервную копию всех данных в JSON"
+              >
+                <Save size={15} /> <span className="hidden sm:inline">Бэкап</span>
+              </button>
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors"
+                title="Загрузить резервную копию из JSON"
+              >
+                <Upload size={15} /> <span className="hidden sm:inline">Восстановить</span>
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".json"
+                onChange={importBackup}
+                className="hidden"
+              />
+              <button
+                onClick={() => window.print()}
+                className="text-xs font-medium text-slate-600 hover:text-slate-900 hover:bg-slate-100 px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 transition-colors"
+                title="Распечатать или сохранить в PDF"
+              >
+                <Printer size={15} />
+              </button>
+            </div>
+          </div>
+
+          <nav className="flex gap-1 overflow-x-auto -mb-px">
+            {navTabs.map((tab) => {
+              const Icon = tab.icon;
+              const isActive = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-all whitespace-nowrap ${
+                    isActive
+                      ? 'border-indigo-600 text-indigo-600'
+                      : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'
+                  }`}
+                >
+                  <Icon size={16} />
+                  {tab.label}
+                  {tab.count !== null && (
+                    <span
+                      className={`text-[11px] px-1.5 py-0.2 rounded-full ${
+                        isActive ? 'bg-indigo-100 text-indigo-700 font-semibold' : 'bg-slate-100 text-slate-500'
+                      }`}
+                    >
+                      {tab.count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 pt-6">
+        {activeTab === 0 && (
+          <TabOverviewCalendar
+            projects={projects}
+            setProjects={setProjects}
+            meetings={meetings}
+            setMeetings={setMeetings}
+            tasks={tasks}
+            calendarEvents={calendarEvents}
+            setCalendarEvents={setCalendarEvents}
+            onOpenProject={handleOpenProjectFromOverview}
+            onNavigateWithFilter={handleNavigateWithFilter}
+          />
+        )}
+        {activeTab === 1 && (
+          <TabMeetings
+            meetings={meetings}
+            setMeetings={setMeetings}
+            projects={projects}
+            onPreviewImages={(images: string[], initialIndex: number, onSaveEdited: (idx: number, newUrl: string) => void) =>
+              setLightboxState({ images, initialIndex, onSaveEdited })
+            }
+            externalProjectFilter={externalProjectFilter}
+            onClearExternalFilter={() => setExternalProjectFilter('')}
+          />
+        )}
+        {activeTab === 2 && (
+          <TabProjectStatus
+            projects={projects}
+            setProjects={setProjects}
+            activeProjectId={activeProjectId}
+            setActiveProjectId={setActiveProjectId}
+            meetings={meetings}
+            setMeetings={setMeetings}
+            tasks={tasks}
+            setTasks={setTasks}
+            onNavigateWithFilter={handleNavigateWithFilter}
+            onPreviewImages={(images: string[], initialIndex: number, onSaveEdited: (idx: number, newUrl: string) => void) =>
+              setLightboxState({ images, initialIndex, onSaveEdited })
+            }
+            onSyncSingleProjectToReport={handleSyncSingleProjectToReport}
+            externalSubTab={externalProjectSubTab}
+            onClearExternalSubTab={() => setExternalProjectSubTab(undefined)}
+          />
+        )}
+        {activeTab === 3 && (
+          <TabWeeklyReport
+            reports={reports}
+            setReports={setReports}
+            projects={projects}
+          />
+        )}
+        {activeTab === 4 && (
+          <TabTasks
+            tasks={tasks}
+            setTasks={setTasks}
+            externalProjectFilter={externalProjectFilter}
+            onClearExternalFilter={() => setExternalProjectFilter('')}
+          />
+        )}
+      </main>
     </div>
   );
 }
