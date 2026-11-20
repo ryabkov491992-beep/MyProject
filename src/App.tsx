@@ -98,14 +98,26 @@ async function idbSet<T>(key: string, val: T): Promise<void> {
   try {
     const db = await openTrackerDB();
     await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(IDB_STORE, 'readwrite');
+      const tx = db.transaction(IDB_STORE, 'writewrite' as any);
       const store = tx.objectStore(IDB_STORE);
       const req = store.put(val, key);
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
     });
   } catch (err) {
-    console.error('IndexedDB write error:', err);
+    // Fallback на корректный режим транзакции
+    try {
+      const db = await openTrackerDB();
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        const req = store.put(val, key);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) {
+      console.error('IndexedDB write error:', e);
+    }
   }
 }
 
@@ -1640,7 +1652,13 @@ function GlobalSearchModal({
           category: `Встреча ${m.projectNum ? `#${m.projectNum}` : ''}`,
           badgeColor: 'bg-sky-100 text-sky-800',
           title: m.desc || m.fix || '(запись встречи)',
-          subtitle: [m.date, m.status].filter(Boolean).join(' • '),
+          subtitle: [
+            m.date ? `Встреча: ${m.date}` : '',
+            m.dueDate ? `Срок: ${m.dueDate}` : '',
+            m.status,
+          ]
+            .filter(Boolean)
+            .join(' • '),
           onClick: () => {
             onNavigateTab(1, m.projectNum || '');
             onClose();
@@ -1741,6 +1759,7 @@ function TabOverviewCalendar({
   projects,
   setProjects,
   meetings,
+  setMeetings,
   tasks,
   calendarEvents,
   setCalendarEvents,
@@ -1764,19 +1783,28 @@ function TabOverviewCalendar({
     custom: true,
   });
 
+  // Единый список «В фокусе»: пункты чек-листа + активные задачи со встреч с датой выполнения
   const focusItems = useMemo(() => {
     const list: Array<{
-      projectId: string;
+      kind: 'checklist' | 'meeting';
+      uid: string;
+      projectId?: string;
+      meetingId?: any;
       projectNum: string;
       projectName: string;
-      taskIndex: number;
+      taskIndex?: number;
       code: string;
       name: string;
+      dueDate: string;
       status: string;
       priority: string;
       estHours: number;
       comment: string;
     }> = [];
+
+    const selectedProjObj = focusProjectFilter
+      ? projects.find((p: any) => p.id === focusProjectFilter)
+      : null;
 
     projects.forEach((p: any) => {
       if (focusProjectFilter && p.id !== focusProjectFilter) return;
@@ -1785,12 +1813,15 @@ function TabOverviewCalendar({
         const st = (t.status || '').toLowerCase();
         if (st === 'в работе' || st === 'требует исправления') {
           list.push({
+            kind: 'checklist',
+            uid: `chk-${p.id}-${idx}`,
             projectId: p.id,
             projectNum: p.num,
             projectName: p.name || '',
             taskIndex: idx,
             code: t.code || '',
             name: t.name,
+            dueDate: '',
             status: t.status,
             priority: String(t.priority || '').trim(),
             estHours: parseFloat(String(t.estHours || '').replace(',', '.')) || 0,
@@ -1800,29 +1831,80 @@ function TabOverviewCalendar({
       });
     });
 
+    (meetings || []).forEach((m: any) => {
+      const st = (m.status || '').toLowerCase();
+      if (['исправлено', 'не требуется', 'на паузе'].includes(st)) return;
+      // Показываем в фокусе пункты встреч, у которых указана дата "на когда сделать" или статус "в работе"
+      if (!m.dueDate && st !== 'в работе') return;
+      if (selectedProjObj && (m.projectNum || '').trim() !== (selectedProjObj.num || '').trim()) {
+        return;
+      }
+
+      const matchedProj = projects.find(
+        (p: any) => (p.num || '').trim() === (m.projectNum || '').trim()
+      );
+      const titleText =
+        m.fix && m.desc
+          ? `${m.fix} (${m.desc})`
+          : m.fix || m.desc || '(Пункт встречи без описания)';
+
+      list.push({
+        kind: 'meeting',
+        uid: `mtg-${m.id}`,
+        meetingId: m.id,
+        projectId: matchedProj?.id,
+        projectNum: m.projectNum || '—',
+        projectName: matchedProj?.name || '',
+        code: 'Встреча',
+        name: titleText,
+        dueDate: m.dueDate || '',
+        status: m.status || 'в работе',
+        priority: '',
+        estHours: 0,
+        comment: m.comment || (m.date ? `Встреча от ${formatToDMY(m.date)}` : ''),
+      });
+    });
+
     return list.sort((a, b) => {
+      // Сначала пункты с ближайшим сроком (dueDate)
+      const dA = parseDateObj(a.dueDate);
+      const dB = parseDateObj(b.dueDate);
+      if (dA && dB) return dA.getTime() - dB.getTime();
+      if (dA && !dB) return -1;
+      if (!dA && dB) return 1;
+
       if (!a.priority && !b.priority) return 0;
       if (!a.priority) return 1;
       if (!b.priority) return -1;
       return a.priority.localeCompare(b.priority, 'ru', { numeric: true });
     });
-  }, [projects, focusProjectFilter]);
+  }, [projects, meetings, focusProjectFilter]);
 
   const totalFocusHours = useMemo(
     () => Number(focusItems.reduce((acc, item) => acc + item.estHours, 0).toFixed(1)),
     [focusItems]
   );
 
-  const handleQuickUpdateFocusStatus = (projectId: string, taskIndex: number, newStatus: string) => {
+  const handleQuickUpdateFocusStatus = (item: any, newStatus: string) => {
+    if (item.kind === 'meeting') {
+      setMeetings(
+        meetings.map((m: any) => (m.id === item.meetingId ? { ...m, status: newStatus } : m))
+      );
+      return;
+    }
+
     setProjects(
       projects.map((p: any) => {
-        if (p.id !== projectId) return p;
+        if (p.id !== item.projectId) return p;
         const updatedTasks = [...(p.tasks || [])];
-        if (updatedTasks[taskIndex]) {
-          updatedTasks[taskIndex] = {
-            ...updatedTasks[taskIndex],
+        if (updatedTasks[item.taskIndex]) {
+          updatedTasks[item.taskIndex] = {
+            ...updatedTasks[item.taskIndex],
             status: newStatus,
-            date: newStatus && !updatedTasks[taskIndex].date ? getTodayDMY() : updatedTasks[taskIndex].date,
+            date:
+              newStatus && !updatedTasks[item.taskIndex].date
+                ? getTodayDMY()
+                : updatedTasks[item.taskIndex].date,
           };
         }
         return { ...p, tasks: updatedTasks };
@@ -1881,11 +1963,14 @@ function TabOverviewCalendar({
 
   if (showSources.meetings) {
     meetings.forEach((m: any) => {
-      if (m.date) {
-        pushEvent(m.date, {
+      // Если указан срок "на когда сделать" (dueDate), ставим в календарь на эту дату; иначе на дату встречи
+      const targetCalendarDate = m.dueDate || m.date;
+      if (targetCalendarDate) {
+        const labelPrefix = m.dueDate ? 'Сделать по встрече: ' : 'Встреча: ';
+        pushEvent(targetCalendarDate, {
           id: `mtg-${m.id}`,
           type: 'meeting',
-          title: m.desc || '(Встреча без описания)',
+          title: `${labelPrefix}${m.fix || m.desc || '(без описания)'}`,
           projectNum: m.projectNum || '',
           status: m.status,
         });
@@ -1968,6 +2053,12 @@ function TabOverviewCalendar({
     return u === 'overdue' || u === 'soon';
   });
 
+  const urgentMeetingsCount = meetings.filter((m: any) => {
+    if ((m.status || '').toLowerCase() === 'исправлено') return false;
+    const u = getDeadlineUrgency(m.dueDate);
+    return u === 'overdue' || u === 'soon';
+  }).length;
+
   const staleRemarksCount = projects.reduce((acc: number, p: any) => {
     const stale = (p.remarks || []).filter((r: any) => {
       const st = (r.status || '').toLowerCase();
@@ -2010,7 +2101,7 @@ function TabOverviewCalendar({
 
   return (
     <div className="space-y-6">
-      {(todayEvents.length > 0 || urgentProjects.length > 0 || staleRemarksCount > 0) && (
+      {(todayEvents.length > 0 || urgentProjects.length > 0 || urgentMeetingsCount > 0 || staleRemarksCount > 0) && (
         <div className="bg-gradient-to-r from-indigo-50 via-white to-amber-50/70 rounded-xl border border-indigo-200/80 p-4 shadow-xs flex flex-col lg:flex-row lg:items-center justify-between gap-3">
           <div className="space-y-1">
             <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-indigo-700">
@@ -2023,6 +2114,11 @@ function TabOverviewCalendar({
               {urgentProjects.length > 0 && (
                 <span className="text-rose-700 font-medium">
                   Горят / просрочены дедлайны этапов: <b>{urgentProjects.map((p: any) => `#${p.num}`).join(', ')}</b>
+                </span>
+              )}
+              {urgentMeetingsCount > 0 && (
+                <span className="text-sky-800 font-medium">
+                  Срочные пункты со встреч: <b>{urgentMeetingsCount}</b>
                 </span>
               )}
               {staleRemarksCount > 0 && (
@@ -2074,17 +2170,19 @@ function TabOverviewCalendar({
         </div>
       </div>
 
-      {/* В ФОКУСЕ / КАЛЬКУЛЯТОР ЗАГРУЗКИ ПО ВСЕМ ПРОЕКТАМ */}
+      {/* В ФОКУСЕ / ЧТО НЕОБХОДИМО ВЫПОЛНИТЬ ПО ВСЕМ ПРОЕКТАМ И ВСТРЕЧАМ */}
       <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
         <div className="px-4 py-3 bg-slate-50/80 border-b border-slate-200/80 flex flex-wrap justify-between items-center gap-3">
           <div className="flex flex-wrap items-center gap-2.5">
             <Flame size={17} className="text-amber-500" />
             <h2 className="font-semibold text-sm text-slate-800">
-              В фокусе / План загрузки ({focusItems.length})
+              В фокусе / Необходимо выполнить ({focusItems.length})
             </h2>
-            <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200/80 flex items-center gap-1">
-              <Clock size={12} /> Суммарно: {totalFocusHours} ч
-            </span>
+            {totalFocusHours > 0 && (
+              <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200/80 flex items-center gap-1">
+                <Clock size={12} /> Суммарно: {totalFocusHours} ч
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
@@ -2105,63 +2203,120 @@ function TabOverviewCalendar({
 
         {focusItems.length === 0 ? (
           <div className="p-8 text-center text-xs text-slate-400">
-            Нет пунктов чек-листа со статусом «в работе» или «требует исправления».
+            Нет активных пунктов чек-листа или задач со встреч в работе.
           </div>
         ) : (
-          <div className="overflow-x-auto max-h-[340px] overflow-y-auto">
+          <div className="overflow-x-auto max-h-[360px] overflow-y-auto">
             <table className="w-full text-left border-collapse text-xs">
               <thead className="sticky top-0 bg-slate-50 border-b border-slate-200 text-[11px] font-semibold text-slate-500 uppercase z-10">
                 <tr>
                   <th className="py-2 px-3 w-28">Проект</th>
-                  <th className="py-2 px-2 w-24">Приоритет</th>
-                  <th className="py-2 px-3 min-w-[260px]">Пункт чек-листа</th>
+                  <th className="py-2 px-2 w-28">Срок / Приоритет</th>
+                  <th className="py-2 px-3 min-w-[260px]">Что необходимо выполнить</th>
                   <th className="py-2 px-2 w-20 text-center">Время</th>
                   <th className="py-2 px-3 w-48">Статус (изменить)</th>
                   <th className="py-2 px-3 min-w-[160px]">Комментарий</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {focusItems.map((item) => (
-                  <tr key={`${item.projectId}-${item.taskIndex}`} className="hover:bg-slate-50/80">
-                    <td className="p-2.5">
-                      <button
-                        type="button"
-                        onClick={() => onOpenProject(item.projectId, 'tasks')}
-                        className="font-bold text-indigo-600 hover:text-indigo-800 hover:underline flex items-center gap-1"
-                        title={`Открыть проект #${item.projectNum}`}
-                      >
-                        #{item.projectNum}
-                        <ArrowUpRight size={12} />
-                      </button>
-                    </td>
-                    <td className="p-2.5">
-                      {item.priority ? (
-                        <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-900 font-semibold">
-                          {item.priority}
-                        </span>
-                      ) : (
-                        <span className="text-slate-300">—</span>
-                      )}
-                    </td>
-                    <td className="p-2.5 font-medium text-slate-700">
-                      {item.code && <span className="font-mono text-slate-400 mr-1.5">{item.code}</span>}
-                      {item.name}
-                    </td>
-                    <td className="p-2.5 text-center font-mono font-semibold text-slate-700">
-                      {item.estHours > 0 ? `${item.estHours} ч` : '—'}
-                    </td>
-                    <td className="p-2">
-                      <StatusPill
-                        value={item.status}
-                        options={DEFAULT_TASK_STATUSES}
-                        onChange={(val) => handleQuickUpdateFocusStatus(item.projectId, item.taskIndex, val)}
-                      />
-                    </td>
-                    <td className="p-2.5 text-slate-500 truncate max-w-[220px]" title={item.comment}>
-                      {item.comment || '—'}
-                    </td>
-                  </tr>
-                ))}
+                {focusItems.map((item) => {
+                  const urgency = item.dueDate ? getDeadlineUrgency(item.dueDate) : null;
+
+                  return (
+                    <tr
+                      key={item.uid}
+                      className={
+                        urgency === 'overdue'
+                          ? 'bg-rose-50/60 hover:bg-rose-100/50'
+                          : urgency === 'soon'
+                          ? 'bg-amber-50/40 hover:bg-amber-100/40'
+                          : 'hover:bg-slate-50/80'
+                      }
+                    >
+                      <td className="p-2.5">
+                        {item.projectId ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onOpenProject(
+                                item.projectId,
+                                item.kind === 'meeting' ? 'related' : 'tasks'
+                              )
+                            }
+                            className="font-bold text-indigo-600 hover:text-indigo-800 hover:underline flex items-center gap-1"
+                            title={`Открыть проект #${item.projectNum}`}
+                          >
+                            #{item.projectNum}
+                            <ArrowUpRight size={12} />
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              onNavigateWithFilter(
+                                1,
+                                item.projectNum !== '—' ? item.projectNum : ''
+                              )
+                            }
+                            className="font-bold text-sky-700 hover:underline"
+                          >
+                            {item.projectNum !== '—' ? `#${item.projectNum}` : 'Общее'}
+                          </button>
+                        )}
+                      </td>
+                      <td className="p-2.5">
+                        {item.dueDate ? (
+                          <span
+                            className={`font-mono px-2 py-0.5 rounded font-semibold ${
+                              urgency === 'overdue'
+                                ? 'bg-rose-100 text-rose-700'
+                                : urgency === 'soon'
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-sky-50 text-sky-700 border border-sky-200/70'
+                            }`}
+                          >
+                            {formatToDMY(item.dueDate)}
+                          </span>
+                        ) : item.priority ? (
+                          <span className="px-2 py-0.5 rounded bg-amber-50 border border-amber-200 text-amber-900 font-semibold">
+                            {item.priority}
+                          </span>
+                        ) : (
+                          <span className="text-slate-300">—</span>
+                        )}
+                      </td>
+                      <td className="p-2.5 font-medium text-slate-700">
+                        {item.kind === 'meeting' ? (
+                          <span className="inline-block px-1.5 py-0.5 mr-1.5 text-[10px] font-bold rounded bg-sky-100 text-sky-800">
+                            Встреча
+                          </span>
+                        ) : (
+                          item.code && (
+                            <span className="font-mono text-slate-400 mr-1.5">{item.code}</span>
+                          )
+                        )}
+                        {item.name}
+                      </td>
+                      <td className="p-2.5 text-center font-mono font-semibold text-slate-700">
+                        {item.estHours > 0 ? `${item.estHours} ч` : '—'}
+                      </td>
+                      <td className="p-2">
+                        <StatusPill
+                          value={item.status}
+                          options={
+                            item.kind === 'meeting'
+                              ? ['в работе', 'исправлено', 'на паузе', 'передано другому']
+                              : DEFAULT_TASK_STATUSES
+                          }
+                          onChange={(val) => handleQuickUpdateFocusStatus(item, val)}
+                        />
+                      </td>
+                      <td className="p-2.5 text-slate-500 truncate max-w-[220px]" title={item.comment}>
+                        {item.comment || '—'}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -2378,7 +2533,7 @@ function TabOverviewCalendar({
                 onChange={(e) => setShowSources({ ...showSources, meetings: e.target.checked })}
                 className="rounded text-sky-600"
               />
-              <span className="px-1.5 py-0.5 rounded bg-sky-100 text-sky-800 font-medium">Встречи</span>
+              <span className="px-1.5 py-0.5 rounded bg-sky-100 text-sky-800 font-medium">Встречи и сроки</span>
             </label>
             <label className="inline-flex items-center gap-1.5 cursor-pointer">
               <input
@@ -2610,6 +2765,7 @@ function MeetingsReportModal({
   filters: {
     projectNum: string;
     date: string;
+    dueDate: string;
     desc: string;
     fix: string;
     screenshot: string;
@@ -2650,7 +2806,8 @@ function MeetingsReportModal({
       const headerParts = [
         `${idx + 1}.`,
         m.projectNum ? `[Проект #${m.projectNum}]` : '',
-        m.date ? `(${formatToDMY(m.date)})` : '',
+        m.date ? `(Встреча: ${formatToDMY(m.date)})` : '',
+        m.dueDate ? `[Срок: ${formatToDMY(m.dueDate)}]` : '',
         m.status ? `— Статус: ${m.status}` : '',
       ].filter(Boolean);
       lines.push(headerParts.join(' '));
@@ -2701,6 +2858,7 @@ function MeetingsReportModal({
             <td align="center">${idx + 1}</td>
             <td align="center"><b>${escapeHtml(m.projectNum || '—')}</b></td>
             <td align="center">${escapeHtml(formatToDMY(m.date))}</td>
+            <td align="center"><b>${escapeHtml(formatToDMY(m.dueDate) || '—')}</b></td>
             <td>${escapeHtml(m.desc)}</td>
             <td>${escapeHtml(m.fix)}</td>
             <td align="center">${imgsHtml}</td>
@@ -2732,7 +2890,8 @@ function MeetingsReportModal({
             <tr style="background:#f1f5f9;">
               <th style="width:30px;">№</th>
               <th style="width:65px;">Проект</th>
-              <th style="width:80px;">Дата</th>
+              <th style="width:80px;">Дата встречи</th>
+              <th style="width:80px;">На когда</th>
               <th>Описание вопроса</th>
               <th>Что исправить / Решение</th>
               <th style="width:160px;">Скриншоты</th>
@@ -2874,6 +3033,7 @@ function TabMeetings({
   const [filters, setFilters] = useState({
     projectNum: '',
     date: '',
+    dueDate: '',
     desc: '',
     fix: '',
     screenshot: '',
@@ -2891,13 +3051,23 @@ function TabMeetings({
 
   const hasActiveFilters = Object.values(filters).some(Boolean);
   const resetFilters = () =>
-    setFilters({ projectNum: '', date: '', desc: '', fix: '', screenshot: '', status: '', comment: '' });
+    setFilters({
+      projectNum: '',
+      date: '',
+      dueDate: '',
+      desc: '',
+      fix: '',
+      screenshot: '',
+      status: '',
+      comment: '',
+    });
 
   const filtered = meetings.filter((m: any) => {
     const imgs = normalizeScreenshots(m.screenshot);
     return (
       (!filters.projectNum || (m.projectNum || '').toLowerCase().includes(filters.projectNum.toLowerCase())) &&
       matchDateFilter(m.date, filters.date) &&
+      matchDateFilter(m.dueDate, filters.dueDate) &&
       (!filters.desc || (m.desc || '').toLowerCase().includes(filters.desc.toLowerCase())) &&
       (!filters.fix || (m.fix || '').toLowerCase().includes(filters.fix.toLowerCase())) &&
       (!filters.screenshot ||
@@ -2937,7 +3107,7 @@ function TabMeetings({
         <div>
           <h2 className="text-lg font-semibold text-slate-800">Протоколы и результаты встреч</h2>
           <p className="text-xs text-slate-500">
-            Отфильтруйте по проекту или дате и нажмите «Отчёт / Outlook», чтобы сформировать протокол
+            Укажите срок в колонке «На когда», чтобы задача автоматически появилась в блоке «В фокусе» на главной странице
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -2965,6 +3135,7 @@ function TabMeetings({
                   id: Date.now(),
                   projectNum: filters.projectNum || '',
                   date: filters.date || getTodayDMY(),
+                  dueDate: filters.dueDate || '',
                   desc: '',
                   fix: '',
                   screenshot: [],
@@ -2987,9 +3158,10 @@ function TabMeetings({
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
                 <th className="pt-3 pb-1.5 px-3 w-28">Проект</th>
-                <th className="pt-3 pb-1.5 px-3 w-36">Дата</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[220px]">Описание вопроса</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[220px]">Что исправить</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Дата встречи</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">На когда</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Описание вопроса</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Что исправить</th>
                 <th className="pt-3 pb-1.5 px-3 w-44 text-center">Скриншоты</th>
                 <th className="pt-3 pb-1.5 px-3 w-44">Статус</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[160px]">Комментарий</th>
@@ -3007,6 +3179,13 @@ function TabMeetings({
                   <ColTextFilter
                     value={filters.date}
                     onChange={(v) => setFilters({ ...filters, date: v })}
+                    placeholder="ДД/ММ/ГГГГ"
+                  />
+                </th>
+                <th className="pb-2.5 px-2">
+                  <ColTextFilter
+                    value={filters.dueDate}
+                    onChange={(v) => setFilters({ ...filters, dueDate: v })}
                     placeholder="ДД/ММ/ГГГГ"
                   />
                 </th>
@@ -3054,78 +3233,102 @@ function TabMeetings({
             <tbody className="divide-y divide-slate-100">
               {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-12 text-center text-slate-400">
+                  <td colSpan={9} className="py-12 text-center text-slate-400">
                     Записей по заданным фильтрам не найдено.
                   </td>
                 </tr>
               ) : (
-                filtered.map((m: any) => (
-                  <tr
-                    key={m.id}
-                    onPaste={(e) => handlePasteImage(e, (img) => appendScreenshotToItem(m.id, img))}
-                    className="group hover:bg-slate-50/70 transition-colors align-top"
-                  >
-                    <td className="p-2">
-                      <input
-                        placeholder="№..."
-                        className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100/70 focus:bg-white focus:ring-2 focus:ring-indigo-500/30 rounded focus:outline-none"
-                        value={m.projectNum}
-                        onChange={(e) => updateItem(m.id, 'projectNum', e.target.value)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <DateInput
-                        value={m.date}
-                        onChange={(val) => updateItem(m.id, 'date', val)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={m.desc}
-                        onChange={(val) => updateItem(m.id, 'desc', val)}
-                        placeholder="Суть вопроса..."
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={m.fix}
-                        onChange={(val) => updateItem(m.id, 'fix', val)}
-                        placeholder="Требуемые правки..."
-                      />
-                    </td>
-                    <td className="p-2 text-center">
-                      <ImageCell
-                        src={m.screenshot}
-                        onChange={(imgs) => updateItem(m.id, 'screenshot', imgs)}
-                        onPreview={onPreviewImages}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <StatusPill
-                        value={m.status}
-                        options={['в работе', 'исправлено', 'на паузе', 'передано другому']}
-                        onChange={(val) => updateItem(m.id, 'status', val)}
-                      />
-                    </td>
-                    <td className="p-2">
-                      <AutoTextarea
-                        value={m.comment}
-                        onChange={(val) => updateItem(m.id, 'comment', val)}
-                        placeholder="Заметка..."
-                        className="text-slate-600 text-xs"
-                      />
-                    </td>
-                    <td className="p-2 text-center">
-                      <button
-                        onClick={() => setMeetings(meetings.filter((mtg: any) => mtg.id !== m.id))}
-                        className="text-slate-300 hover:text-rose-500 p-1 rounded opacity-0 group-hover:opacity-100 transition-all"
-                        title="Удалить строку"
-                      >
-                        <Trash2 size={15} />
-                      </button>
-                    </td>
-                  </tr>
-                ))
+                filtered.map((m: any) => {
+                  const isDone = (m.status || '').toLowerCase() === 'исправлено';
+                  const urgency = !isDone ? getDeadlineUrgency(m.dueDate) : null;
+
+                  return (
+                    <tr
+                      key={m.id}
+                      onPaste={(e) => handlePasteImage(e, (img) => appendScreenshotToItem(m.id, img))}
+                      className={`group transition-colors align-top ${
+                        urgency === 'overdue'
+                          ? 'bg-rose-50/60 hover:bg-rose-100/50'
+                          : urgency === 'soon'
+                          ? 'bg-amber-50/40 hover:bg-amber-100/40'
+                          : 'hover:bg-slate-50/70'
+                      }`}
+                    >
+                      <td className="p-2">
+                        <input
+                          placeholder="№..."
+                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100/70 focus:bg-white focus:ring-2 focus:ring-indigo-500/30 rounded focus:outline-none"
+                          value={m.projectNum}
+                          onChange={(e) => updateItem(m.id, 'projectNum', e.target.value)}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <DateInput
+                          value={m.date}
+                          onChange={(val) => updateItem(m.id, 'date', val)}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <DateInput
+                          value={m.dueDate || ''}
+                          onChange={(val) => updateItem(m.id, 'dueDate', val)}
+                          className={
+                            urgency === 'overdue'
+                              ? 'text-rose-700 font-bold'
+                              : urgency === 'soon'
+                              ? 'text-amber-800 font-semibold'
+                              : 'text-sky-700 font-medium'
+                          }
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={m.desc}
+                          onChange={(val) => updateItem(m.id, 'desc', val)}
+                          placeholder="Суть вопроса..."
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={m.fix}
+                          onChange={(val) => updateItem(m.id, 'fix', val)}
+                          placeholder="Требуемые правки..."
+                        />
+                      </td>
+                      <td className="p-2 text-center">
+                        <ImageCell
+                          src={m.screenshot}
+                          onChange={(imgs) => updateItem(m.id, 'screenshot', imgs)}
+                          onPreview={onPreviewImages}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <StatusPill
+                          value={m.status}
+                          options={['в работе', 'исправлено', 'на паузе', 'передано другому']}
+                          onChange={(val) => updateItem(m.id, 'status', val)}
+                        />
+                      </td>
+                      <td className="p-2">
+                        <AutoTextarea
+                          value={m.comment}
+                          onChange={(val) => updateItem(m.id, 'comment', val)}
+                          placeholder="Заметка..."
+                          className="text-slate-600 text-xs"
+                        />
+                      </td>
+                      <td className="p-2 text-center">
+                        <button
+                          onClick={() => setMeetings(meetings.filter((mtg: any) => mtg.id !== m.id))}
+                          className="text-slate-300 hover:text-rose-500 p-1 rounded opacity-0 group-hover:opacity-100 transition-all"
+                          title="Удалить строку"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -3709,6 +3912,7 @@ function TabProjectStatus({
   const [fileFilters, setFileFilters] = useState({ name: '', status: '', date: '' });
   const [relMeetingFilters, setRelMeetingFilters] = useState({
     date: '',
+    dueDate: '',
     desc: '',
     fix: '',
     status: '',
@@ -5486,9 +5690,9 @@ function TabProjectStatus({
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
                     <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                      <th className="pt-2 pb-1 px-3">Процесс</th>
-                      <th className="pt-2 pb-1 px-3 w-48">Статус</th>
-                      <th className="pt-2 pb-1 px-3 w-36">Дата</th>
+                      <th className="pt-2.5 pb-1.5 px-3">Элемент</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-48">Статус</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-36">Дата</th>
                     </tr>
                     <tr className="bg-slate-50/40 border-b border-slate-200">
                       <th className="pb-2 px-2">
@@ -5497,7 +5701,7 @@ function TabProjectStatus({
                       <th className="pb-2 px-2">
                         <ColSelectFilter
                           value={permFilters.status}
-                          options={['отправили на согласование', 'требует исправления', 'одобрен']}
+                          options={['отправили на согласование', 'одобрен', 'требует исправления']}
                           onChange={(v) => setPermFilters({ ...permFilters, status: v })}
                         />
                       </th>
@@ -5510,36 +5714,22 @@ function TabProjectStatus({
                     {projectData.permissions
                       .filter(
                         (p: any) =>
-                          (!permFilters.name || p.name.toLowerCase().includes(permFilters.name.toLowerCase())) &&
+                          (!permFilters.name || (p.name || '').toLowerCase().includes(permFilters.name.toLowerCase())) &&
                           matchStatusFilter(p.status, permFilters.status) &&
                           matchDateFilter(p.date, permFilters.date)
                       )
                       .map((p: any) => {
                         const i = projectData.permissions.findIndex((item: any) => item.name === p.name);
-                        const days =
-                          (p.status || '').toLowerCase() === 'отправили на согласование'
-                            ? getDaysSinceDate(p.date)
-                            : null;
-                        const isStale = days !== null && days >= 5;
-
                         return (
-                          <tr key={i} className={isStale ? 'bg-amber-50/60' : 'hover:bg-slate-50/70'}>
-                            <td className="p-3 font-medium text-slate-700">
-                              {p.name}
-                              {isStale && (
-                                <span className="ml-2 text-[10px] font-bold text-amber-800 bg-amber-200/80 px-1.5 py-0.5 rounded">
-                                  {days} дн.
-                                </span>
-                              )}
-                            </td>
+                          <tr key={i} className="hover:bg-slate-50/70">
+                            <td className="p-3 font-medium text-slate-700">{p.name}</td>
                             <td className="p-2">
                               <StatusPill
                                 value={p.status}
-                                options={['отправили на согласование', 'требует исправления', 'одобрен']}
+                                options={['отправили на согласование', 'одобрен', 'требует исправления']}
                                 onChange={(val) => {
                                   const arr = [...projectData.permissions];
                                   arr[i].status = val;
-                                  if (val && !arr[i].date) arr[i].date = getTodayDMY();
                                   updateField('permissions', arr);
                                 }}
                               />
@@ -5563,7 +5753,7 @@ function TabProjectStatus({
 
               <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
                 <div className="p-4 border-b border-slate-100 flex justify-between items-center">
-                  <h3 className="font-semibold text-slate-800">Исходные данные и смежники</h3>
+                  <h3 className="font-semibold text-slate-800">Входящие исходные файлы</h3>
                   {Object.values(fileFilters).some(Boolean) && (
                     <button
                       onClick={() => setFileFilters({ name: '', status: '', date: '' })}
@@ -5576,9 +5766,9 @@ function TabProjectStatus({
                 <table className="w-full text-left border-collapse text-sm">
                   <thead>
                     <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
-                      <th className="pt-2 pb-1 px-3">Документ / Раздел</th>
-                      <th className="pt-2 pb-1 px-3 w-40">Наличие</th>
-                      <th className="pt-2 pb-1 px-3 w-36">Дата</th>
+                      <th className="pt-2.5 pb-1.5 px-3">Документ</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-44">Наличие</th>
+                      <th className="pt-2.5 pb-1.5 px-3 w-36">Дата</th>
                     </tr>
                     <tr className="bg-slate-50/40 border-b border-slate-200">
                       <th className="pb-2 px-2">
@@ -5600,7 +5790,7 @@ function TabProjectStatus({
                     {projectData.files
                       .filter(
                         (f: any) =>
-                          (!fileFilters.name || f.name.toLowerCase().includes(fileFilters.name.toLowerCase())) &&
+                          (!fileFilters.name || (f.name || '').toLowerCase().includes(fileFilters.name.toLowerCase())) &&
                           matchStatusFilter(f.status, fileFilters.status) &&
                           matchDateFilter(f.date, fileFilters.date)
                       )
@@ -5616,7 +5806,6 @@ function TabProjectStatus({
                                 onChange={(val) => {
                                   const arr = [...projectData.files];
                                   arr[i].status = val;
-                                  if (val && !arr[i].date) arr[i].date = getTodayDMY();
                                   updateField('files', arr);
                                 }}
                               />
@@ -5637,43 +5826,23 @@ function TabProjectStatus({
                   </tbody>
                 </table>
               </div>
-
-              <div className="lg:col-span-2 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
-                <h3 className="font-semibold text-slate-800 mb-2">Общие заметки по объекту</h3>
-                <AutoTextarea
-                  value={projectData.comment}
-                  onChange={(val) => updateField('comment', val)}
-                  placeholder="Ключевые особенности объекта, контакты ГИПа, ссылки на папки..."
-                  className="min-h-[90px] bg-slate-50/70 p-3 text-sm text-slate-700 border border-slate-200/70"
-                />
-              </div>
             </div>
           )}
 
-          {/* РАЗДЕЛ 5: ПОЛНАЯ ИНФОРМАЦИЯ ПО ВСТРЕЧАМ И ЗАДАЧАМ ПРОЕКТА */}
+          {/* РАЗДЕЛ 5: СВЯЗАННЫЕ ВСТРЕЧИ И БЫСТРЫЕ ЗАДАЧИ */}
           {subTab === 'related' && (
             <div className="space-y-6">
               <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
                 <div className="p-4 border-b border-slate-100 flex flex-wrap justify-between items-center gap-3">
                   <div>
                     <h3 className="font-semibold text-slate-800">
-                      Протоколы встреч по проекту {projectData.num} ({projectMeetings.length})
+                      Встречи по проекту {projectData.num} ({projectMeetings.length})
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Все изменения синхронизируются с общей вкладкой «Встречи»
+                      Редактируется напрямую — изменения синхронизируются со вкладкой «Встречи» и главной страницей
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
-                    {Object.values(relMeetingFilters).some(Boolean) && (
-                      <button
-                        onClick={() =>
-                          setRelMeetingFilters({ date: '', desc: '', fix: '', status: '', comment: '' })
-                        }
-                        className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1 rounded-lg flex items-center gap-1"
-                      >
-                        <RotateCcw size={12} /> Сбросить
-                      </button>
-                    )}
                     <button
                       onClick={() =>
                         setMeetings([
@@ -5681,6 +5850,7 @@ function TabProjectStatus({
                             id: Date.now(),
                             projectNum: projectData.num,
                             date: getTodayDMY(),
+                            dueDate: '',
                             desc: '',
                             fix: '',
                             screenshot: [],
@@ -5690,112 +5860,101 @@ function TabProjectStatus({
                           ...meetings,
                         ])
                       }
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 shadow-xs"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1"
                     >
-                      <Plus size={14} /> Новая встреча
+                      <Plus size={14} /> Запись встречи
                     </button>
                     <button
                       onClick={() => onNavigateWithFilter(1, projectData.num)}
-                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 px-3 py-1.5 rounded-lg"
+                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 flex items-center gap-1 bg-indigo-50 px-3 py-1.5 rounded-lg"
                     >
-                      В общий список →
+                      Открыть во вкладке <ArrowUpRight size={14} />
                     </button>
                   </div>
                 </div>
 
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-sm">
-                    <thead>
-                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дата</th>
-                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Описание вопроса</th>
-                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Что исправить</th>
-                        <th className="pt-2.5 pb-1.5 px-3 w-44 text-center">Скриншоты</th>
-                        <th className="pt-2.5 pb-1.5 px-3 w-44">Статус</th>
-                        <th className="pt-2.5 pb-1.5 px-3 min-w-[150px]">Комментарий</th>
-                        <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
-                      </tr>
-                      <tr className="bg-slate-50/40 border-b border-slate-200">
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relMeetingFilters.date}
-                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, date: v })}
-                            placeholder="ДД/ММ/ГГГГ"
-                          />
-                        </th>
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relMeetingFilters.desc}
-                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, desc: v })}
-                          />
-                        </th>
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relMeetingFilters.fix}
-                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, fix: v })}
-                          />
-                        </th>
-                        <th className="pb-2 px-2"></th>
-                        <th className="pb-2 px-2">
-                          <ColSelectFilter
-                            value={relMeetingFilters.status}
-                            options={['в работе', 'исправлено', 'на паузе', 'передано другому']}
-                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, status: v })}
-                          />
-                        </th>
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relMeetingFilters.comment}
-                            onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, comment: v })}
-                          />
-                        </th>
-                        <th className="pb-2 px-2"></th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {projectMeetings.length === 0 ? (
-                        <tr>
-                          <td colSpan={7} className="py-10 text-center text-xs text-slate-400">
-                            По проекту {projectData.num} записей встреч пока нет.
-                          </td>
+                {projectMeetings.length === 0 ? (
+                  <p className="p-8 text-center text-sm text-slate-400">
+                    Для проекта {projectData.num} записей встреч пока нет.
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-sm">
+                      <thead>
+                        <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                          <th className="pt-2.5 pb-1.5 px-2 w-36">Дата встречи</th>
+                          <th className="pt-2.5 pb-1.5 px-2 w-36">На когда</th>
+                          <th className="pt-2.5 pb-1.5 px-2 min-w-[200px]">Описание вопроса</th>
+                          <th className="pt-2.5 pb-1.5 px-2 min-w-[200px]">Что исправить</th>
+                          <th className="pt-2.5 pb-1.5 px-2 w-44 text-center">Скриншоты</th>
+                          <th className="pt-2.5 pb-1.5 px-2 w-44">Статус</th>
+                          <th className="pt-2.5 pb-1.5 px-2 min-w-[160px]">Комментарий</th>
+                          <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
                         </tr>
-                      ) : (
-                        projectMeetings
+                        <tr className="bg-slate-50/40 border-b border-slate-200">
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relMeetingFilters.date} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relMeetingFilters.dueDate} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, dueDate: v })} placeholder="ДД/ММ/ГГГГ" />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relMeetingFilters.desc} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, desc: v })} />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relMeetingFilters.fix} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, fix: v })} />
+                          </th>
+                          <th className="pb-2 px-1.5"></th>
+                          <th className="pb-2 px-1.5">
+                            <ColSelectFilter
+                              value={relMeetingFilters.status}
+                              options={['в работе', 'исправлено', 'на паузе', 'передано другому']}
+                              onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, status: v })}
+                            />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relMeetingFilters.comment} onChange={(v) => setRelMeetingFilters({ ...relMeetingFilters, comment: v })} />
+                          </th>
+                          <th className="pb-2 px-1.5"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {projectMeetings
                           .filter(
                             (m: any) =>
                               matchDateFilter(m.date, relMeetingFilters.date) &&
-                              (!relMeetingFilters.desc ||
-                                (m.desc || '').toLowerCase().includes(relMeetingFilters.desc.toLowerCase())) &&
-                              (!relMeetingFilters.fix ||
-                                (m.fix || '').toLowerCase().includes(relMeetingFilters.fix.toLowerCase())) &&
+                              matchDateFilter(m.dueDate, relMeetingFilters.dueDate) &&
+                              (!relMeetingFilters.desc || (m.desc || '').toLowerCase().includes(relMeetingFilters.desc.toLowerCase())) &&
+                              (!relMeetingFilters.fix || (m.fix || '').toLowerCase().includes(relMeetingFilters.fix.toLowerCase())) &&
                               matchStatusFilter(m.status, relMeetingFilters.status) &&
-                              (!relMeetingFilters.comment ||
-                                (m.comment || '').toLowerCase().includes(relMeetingFilters.comment.toLowerCase()))
+                              (!relMeetingFilters.comment || (m.comment || '').toLowerCase().includes(relMeetingFilters.comment.toLowerCase()))
                           )
                           .map((m: any) => (
                             <tr
                               key={m.id}
                               onPaste={(e) => handlePasteImage(e, (img) => appendScreenshotToMeetingRow(m.id, img))}
-                              className="group hover:bg-slate-50/70 transition-colors align-top"
+                              className="group hover:bg-slate-50/70 align-top"
                             >
                               <td className="p-2">
-                                <DateInput
-                                  value={m.date}
-                                  onChange={(val) => updateMeetingRow(m.id, 'date', val)}
-                                />
+                                <DateInput value={m.date} onChange={(val) => updateMeetingRow(m.id, 'date', val)} />
+                              </td>
+                              <td className="p-2">
+                                <DateInput value={m.dueDate || ''} onChange={(val) => updateMeetingRow(m.id, 'dueDate', val)} />
                               </td>
                               <td className="p-2">
                                 <AutoTextarea
                                   value={m.desc}
                                   onChange={(val) => updateMeetingRow(m.id, 'desc', val)}
                                   placeholder="Суть вопроса..."
+                                  className="text-xs"
                                 />
                               </td>
                               <td className="p-2">
                                 <AutoTextarea
                                   value={m.fix}
                                   onChange={(val) => updateMeetingRow(m.id, 'fix', val)}
-                                  placeholder="Требуемые правки..."
+                                  placeholder="Что исправить..."
+                                  className="text-xs"
                                 />
                               </td>
                               <td className="p-2 text-center">
@@ -5816,25 +5975,24 @@ function TabProjectStatus({
                                 <AutoTextarea
                                   value={m.comment}
                                   onChange={(val) => updateMeetingRow(m.id, 'comment', val)}
-                                  placeholder="Заметка..."
-                                  className="text-slate-600 text-xs"
+                                  placeholder="Комментарий..."
+                                  className="text-xs text-slate-600"
                                 />
                               </td>
                               <td className="p-2 text-center">
                                 <button
-                                  onClick={() => setMeetings(meetings.filter((mtg: any) => mtg.id !== m.id))}
-                                  className="text-slate-300 hover:text-rose-500 p-1 rounded opacity-0 group-hover:opacity-100 transition-all"
-                                  title="Удалить запись"
+                                  onClick={() => setMeetings(meetings.filter((item: any) => item.id !== m.id))}
+                                  className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
                                 >
                                   <Trash2 size={14} />
                                 </button>
                               </td>
                             </tr>
-                          ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
 
               <div className="bg-white rounded-xl border border-slate-200/80 shadow-sm overflow-hidden">
@@ -5844,27 +6002,17 @@ function TabProjectStatus({
                       Быстрые задачи по проекту {projectData.num} ({projectQuickTasks.length})
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Все изменения синхронизируются с общей вкладкой «Задачи»
+                      Редактируется напрямую — изменения синхронизируются со вкладкой «Задачи»
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
-                    {Object.values(relTaskFilters).some(Boolean) && (
-                      <button
-                        onClick={() =>
-                          setRelTaskFilters({ date: '', desc: '', estDate: '', status: '', comment: '' })
-                        }
-                        className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1 rounded-lg flex items-center gap-1"
-                      >
-                        <RotateCcw size={12} /> Сбросить
-                      </button>
-                    )}
                     <button
                       onClick={() =>
                         setTasks([
                           {
                             id: Date.now(),
-                            project: projectData.num,
                             date: getTodayDMY(),
+                            project: projectData.num,
                             desc: '',
                             estDate: '',
                             status: 'в работе',
@@ -5873,111 +6021,88 @@ function TabProjectStatus({
                           ...tasks,
                         ])
                       }
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1 shadow-xs"
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1"
                     >
-                      <Plus size={14} /> Новая задача
+                      <Plus size={14} /> Быстрая задача
                     </button>
                     <button
                       onClick={() => onNavigateWithFilter(4, projectData.num)}
-                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 bg-indigo-50 px-3 py-1.5 rounded-lg"
+                      className="text-xs font-medium text-indigo-600 hover:text-indigo-800 flex items-center gap-1 bg-indigo-50 px-3 py-1.5 rounded-lg"
                     >
-                      В общий список →
+                      Открыть во вкладке <ArrowUpRight size={14} />
                     </button>
                   </div>
                 </div>
 
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-sm">
-                    <thead>
-                      <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дата постановки</th>
-                        <th className="pt-2.5 pb-1.5 px-3 min-w-[260px]">Описание задачи</th>
-                        <th className="pt-2.5 pb-1.5 px-3 w-36">Дедлайн</th>
-                        <th className="pt-2.5 pb-1.5 px-3 w-44">Статус</th>
-                        <th className="pt-2.5 pb-1.5 px-3 min-w-[200px]">Комментарий</th>
-                        <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
-                      </tr>
-                      <tr className="bg-slate-50/40 border-b border-slate-200">
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relTaskFilters.date}
-                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, date: v })}
-                            placeholder="ДД/ММ/ГГГГ"
-                          />
-                        </th>
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relTaskFilters.desc}
-                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, desc: v })}
-                          />
-                        </th>
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relTaskFilters.estDate}
-                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, estDate: v })}
-                            placeholder="ДД/ММ/ГГГГ"
-                          />
-                        </th>
-                        <th className="pb-2 px-2">
-                          <ColSelectFilter
-                            value={relTaskFilters.status}
-                            options={['в работе', 'выполнена', 'на паузе', 'передано']}
-                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, status: v })}
-                          />
-                        </th>
-                        <th className="pb-2 px-2">
-                          <ColTextFilter
-                            value={relTaskFilters.comment}
-                            onChange={(v) => setRelTaskFilters({ ...relTaskFilters, comment: v })}
-                          />
-                        </th>
-                        <th className="pb-2 px-2"></th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {projectQuickTasks.length === 0 ? (
-                        <tr>
-                          <td colSpan={6} className="py-10 text-center text-xs text-slate-400">
-                            По проекту {projectData.num} быстрых задач пока нет.
-                          </td>
+                {projectQuickTasks.length === 0 ? (
+                  <p className="p-8 text-center text-sm text-slate-400">
+                    Для проекта {projectData.num} быстрых задач пока нет.
+                  </p>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-sm">
+                      <thead>
+                        <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase">
+                          <th className="pt-2.5 pb-1.5 px-2 w-36">Дата</th>
+                          <th className="pt-2.5 pb-1.5 px-2 min-w-[240px]">Описание задачи</th>
+                          <th className="pt-2.5 pb-1.5 px-2 w-36">Срок</th>
+                          <th className="pt-2.5 pb-1.5 px-2 w-44">Статус</th>
+                          <th className="pt-2.5 pb-1.5 px-2 min-w-[180px]">Комментарий</th>
+                          <th className="pt-2.5 pb-1.5 px-2 w-10"></th>
                         </tr>
-                      ) : (
-                        projectQuickTasks
+                        <tr className="bg-slate-50/40 border-b border-slate-200">
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relTaskFilters.date} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relTaskFilters.desc} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, desc: v })} />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relTaskFilters.estDate} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, estDate: v })} placeholder="ДД/ММ/ГГГГ" />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColSelectFilter
+                              value={relTaskFilters.status}
+                              options={['в работе', 'выполнена', 'передано', 'на паузе']}
+                              onChange={(v) => setRelTaskFilters({ ...relTaskFilters, status: v })}
+                            />
+                          </th>
+                          <th className="pb-2 px-1.5">
+                            <ColTextFilter value={relTaskFilters.comment} onChange={(v) => setRelTaskFilters({ ...relTaskFilters, comment: v })} />
+                          </th>
+                          <th className="pb-2 px-1.5"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100">
+                        {projectQuickTasks
                           .filter(
                             (t: any) =>
                               matchDateFilter(t.date, relTaskFilters.date) &&
-                              (!relTaskFilters.desc ||
-                                (t.desc || '').toLowerCase().includes(relTaskFilters.desc.toLowerCase())) &&
+                              (!relTaskFilters.desc || (t.desc || '').toLowerCase().includes(relTaskFilters.desc.toLowerCase())) &&
                               matchDateFilter(t.estDate, relTaskFilters.estDate) &&
                               matchStatusFilter(t.status, relTaskFilters.status) &&
-                              (!relTaskFilters.comment ||
-                                (t.comment || '').toLowerCase().includes(relTaskFilters.comment.toLowerCase()))
+                              (!relTaskFilters.comment || (t.comment || '').toLowerCase().includes(relTaskFilters.comment.toLowerCase()))
                           )
                           .map((t: any) => (
                             <tr key={t.id} className="group hover:bg-slate-50/70 align-top">
                               <td className="p-2">
-                                <DateInput
-                                  value={t.date}
-                                  onChange={(val) => updateQuickTaskRow(t.id, 'date', val)}
-                                />
+                                <DateInput value={t.date} onChange={(val) => updateQuickTaskRow(t.id, 'date', val)} />
                               </td>
                               <td className="p-2">
                                 <AutoTextarea
                                   value={t.desc}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'desc', val)}
-                                  placeholder="Что нужно сделать..."
+                                  placeholder="Описание задачи..."
+                                  className="text-xs font-medium"
                                 />
                               </td>
                               <td className="p-2">
-                                <DateInput
-                                  value={t.estDate}
-                                  onChange={(val) => updateQuickTaskRow(t.id, 'estDate', val)}
-                                />
+                                <DateInput value={t.estDate} onChange={(val) => updateQuickTaskRow(t.id, 'estDate', val)} />
                               </td>
                               <td className="p-2">
                                 <StatusPill
                                   value={t.status}
-                                  options={['в работе', 'выполнена', 'на паузе', 'передано']}
+                                  options={['в работе', 'выполнена', 'передано', 'на паузе']}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'status', val)}
                                 />
                               </td>
@@ -5985,25 +6110,24 @@ function TabProjectStatus({
                                 <AutoTextarea
                                   value={t.comment}
                                   onChange={(val) => updateQuickTaskRow(t.id, 'comment', val)}
-                                  placeholder="Комментарий..."
+                                  placeholder="Примечание..."
                                   className="text-xs text-slate-600"
                                 />
                               </td>
                               <td className="p-2 text-center">
                                 <button
                                   onClick={() => setTasks(tasks.filter((item: any) => item.id !== t.id))}
-                                  className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                                  title="Удалить задачу"
+                                  className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100"
                                 >
                                   <Trash2 size={14} />
                                 </button>
                               </td>
                             </tr>
-                          ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
+                          ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -6013,70 +6137,66 @@ function TabProjectStatus({
   );
 }
 
-// === 12. ВКЛАДКА 3: ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ ===
+// === 12. ВКЛАДКА 3: ОТЧЕТ ===
 
-function TabWeeklyReport({ reports, setReports, projects }: any) {
+function TabReport({ reportRows, setReportRows, projects }: any) {
   const [selectedWeek, setSelectedWeek] = useState(getCurrentISOWeek());
   const [filters, setFilters] = useState({
-    num: '',
-    name: '',
+    projectNum: '',
     stage: '',
     deadline: '',
     done: '',
     inProgress: '',
     blockers: '',
   });
-  const [copiedReport, setCopiedReport] = useState(false);
+  const [copiedWeek, setCopiedWeek] = useState(false);
 
   const hasActiveFilters = Object.values(filters).some(Boolean);
   const resetFilters = () =>
-    setFilters({ num: '', name: '', stage: '', deadline: '', done: '', inProgress: '', blockers: '' });
+    setFilters({ projectNum: '', stage: '', deadline: '', done: '', inProgress: '', blockers: '' });
 
-  const weekReports = reports
-    .filter((r: any) => r.week === selectedWeek)
-    .filter((r: any) => {
-      return (
-        (!filters.num || (r.num || '').toLowerCase().includes(filters.num.toLowerCase())) &&
-        (!filters.name || (r.name || '').toLowerCase().includes(filters.name.toLowerCase())) &&
-        (!filters.stage || (r.stage || '').toLowerCase().includes(filters.stage.toLowerCase())) &&
-        matchDateFilter(r.deadline, filters.deadline) &&
-        (!filters.done || (r.done || '').toLowerCase().includes(filters.done.toLowerCase())) &&
-        (!filters.inProgress || (r.inProgress || '').toLowerCase().includes(filters.inProgress.toLowerCase())) &&
-        (!filters.blockers || (r.blockers || '').toLowerCase().includes(filters.blockers.toLowerCase()))
-      );
-    });
+  const filtered = reportRows.filter(
+    (r: any) =>
+      r.week === selectedWeek &&
+      (!filters.projectNum || (r.projectNum || '').toLowerCase().includes(filters.projectNum.toLowerCase())) &&
+      (!filters.stage || (r.stage || '').toLowerCase().includes(filters.stage.toLowerCase())) &&
+      matchDateFilter(r.deadline, filters.deadline) &&
+      (!filters.done || (r.done || '').toLowerCase().includes(filters.done.toLowerCase())) &&
+      (!filters.inProgress || (r.inProgress || '').toLowerCase().includes(filters.inProgress.toLowerCase())) &&
+      (!filters.blockers || (r.blockers || '').toLowerCase().includes(filters.blockers.toLowerCase()))
+  );
 
-  const handleSyncAllFromProjects = () => {
+  const updateRow = (id: any, field: string, value: string) => {
+    setReportRows(reportRows.map((r: any) => (r.id === id ? { ...r, [field]: value } : r)));
+  };
+
+  const handleGenerateFromProjects = () => {
     if (!projects.length) {
-      alert('Сначала добавьте хотя бы один проект во вкладке «Статус проекта».');
+      alert('Сначала создайте хотя бы один проект во вкладке «Статус проекта».');
       return;
     }
 
-    const otherWeeks = reports.filter((r: any) => r.week !== selectedWeek);
-    const currentWeekRows = [...reports.filter((r: any) => r.week === selectedWeek)];
-
+    const updatedRows = [...reportRows];
     projects.forEach((p: any, idx: number) => {
       const summary = buildProjectReportSummary(p, selectedWeek);
-      const existingIndex = currentWeekRows.findIndex(
-        (r: any) => (r.num || '').trim() === (p.num || '').trim()
+      const existingIdx = updatedRows.findIndex(
+        (r: any) => r.week === selectedWeek && (r.projectNum || '').trim() === (p.num || '').trim()
       );
 
-      if (existingIndex >= 0) {
-        currentWeekRows[existingIndex] = {
-          ...currentWeekRows[existingIndex],
-          name: p.name || currentWeekRows[existingIndex].name,
-          stage: summary.stage || currentWeekRows[existingIndex].stage,
-          deadline: summary.deadline || currentWeekRows[existingIndex].deadline,
+      if (existingIdx !== -1) {
+        updatedRows[existingIdx] = {
+          ...updatedRows[existingIdx],
+          stage: summary.stage || updatedRows[existingIdx].stage || '',
+          deadline: summary.deadline || updatedRows[existingIdx].deadline || '',
           done: summary.done,
           inProgress: summary.inProgress,
           blockers: summary.blockers,
         };
       } else {
-        currentWeekRows.push({
+        updatedRows.push({
           id: Date.now() + idx,
           week: selectedWeek,
-          num: p.num,
-          name: p.name || '',
+          projectNum: p.num,
           stage: summary.stage,
           deadline: summary.deadline,
           done: summary.done,
@@ -6086,80 +6206,119 @@ function TabWeeklyReport({ reports, setReports, projects }: any) {
       }
     });
 
-    setReports([...otherWeeks, ...currentWeekRows]);
+    setReportRows(updatedRows);
   };
 
-  const handleCopyReportText = () => {
-    if (!weekReports.length) return;
-    const lines = weekReports.map((r: any) => {
-      const parts = [
-        `▪ Проект ${r.num}${r.name ? ` (${r.name})` : ''}${r.stage ? ` [${r.stage}]` : ''}${
-          r.deadline ? ` — дедлайн: ${formatToDMY(r.deadline)}` : ''
-        }`,
-        `  Выполнено: ${r.done || 'На этой неделе ничего не выполнено'}`,
-        r.inProgress ? `  В работе: ${r.inProgress}` : '',
-        r.blockers ? `  Блокеры: ${r.blockers}` : '',
-      ].filter(Boolean);
-      return parts.join('\n');
-    });
-    const text = `Еженедельный отчет по проектам (${selectedWeek}):\n\n${lines.join('\n\n')}`;
-    navigator.clipboard.writeText(text);
-    setCopiedReport(true);
-    setTimeout(() => setCopiedReport(false), 2500);
+  const handleCopyWeeklyReport = () => {
+    const rowsToCopy = filtered;
+    if (!rowsToCopy.length) {
+      alert('Нет строк в отчете за выбранную неделю.');
+      return;
+    }
+
+    const range = getWeekRange(selectedWeek);
+    const rangeLabel = range
+      ? ` (${formatToDMY(range.start.toISOString().slice(0, 10))} — ${formatToDMY(
+          range.end.toISOString().slice(0, 10)
+        )})`
+      : '';
+
+    const header = `ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ ПО ПРОЕКТАМ — ${selectedWeek}${rangeLabel}\n\n`;
+    const body = rowsToCopy
+      .map((r: any, idx: number) => {
+        const titleParts = [
+          `${idx + 1}. Проект #${r.projectNum || '—'}`,
+          r.stage ? `[Стадия: ${r.stage}]` : '',
+          r.deadline ? `[Дедлайн: ${formatToDMY(r.deadline)}]` : '',
+        ]
+          .filter(Boolean)
+          .join(' ');
+        const lines = [
+          titleParts,
+          `   • Выполнено: ${r.done || '—'}`,
+          `   • В работе: ${r.inProgress || '—'}`,
+        ];
+        if (r.blockers && r.blockers.trim()) {
+          lines.push(`   • Блокеры / Проблемы: ${r.blockers.trim()}`);
+        }
+        return lines.join('\n');
+      })
+      .join('\n\n');
+
+    navigator.clipboard.writeText(header + body);
+    setCopiedWeek(true);
+    setTimeout(() => setCopiedWeek(false), 2500);
   };
+
+  const weekRange = getWeekRange(selectedWeek);
 
   return (
     <div className="space-y-4">
-      <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm flex flex-col lg:flex-row justify-between items-start lg:items-center gap-3">
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 rounded-lg px-3 py-1.5">
-            <Calendar size={16} className="text-indigo-600" />
-            <span className="text-xs font-semibold text-slate-500">Неделя:</span>
+      <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-800">Еженедельный сводный отчет</h2>
+          <p className="text-xs text-slate-500">
+            Автоматически собирает выполненные задачи за выбранную неделю, текущие работы и активные блокеры
+          </p>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-2 bg-slate-50 border border-slate-200 px-3 py-1.5 rounded-lg">
+            <span className="text-xs font-medium text-slate-500">Неделя:</span>
             <input
               type="week"
               value={selectedWeek}
               onChange={(e) => setSelectedWeek(e.target.value)}
-              className="bg-transparent text-sm font-semibold text-slate-800 focus:outline-none cursor-pointer"
+              className="text-sm font-semibold text-slate-700 bg-transparent focus:outline-none cursor-pointer"
             />
+            {weekRange && (
+              <span className="text-[11px] text-slate-400 font-mono hidden sm:inline">
+                ({formatToDMY(weekRange.start.toISOString().slice(0, 10))}–
+                {formatToDMY(weekRange.end.toISOString().slice(0, 10))})
+              </span>
+            )}
           </div>
+
+          <button
+            type="button"
+            onClick={handleGenerateFromProjects}
+            className="bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 shadow-sm transition-colors"
+            title="Сформировать и обновить строки по всем проектам из их чек-листов за выбранную неделю"
+          >
+            <RefreshCw size={14} /> Сформировать из проектов
+          </button>
+
+          <button
+            type="button"
+            onClick={handleCopyWeeklyReport}
+            className={`px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
+              copiedWeek
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+            }`}
+            title="Скопировать весь отчет за неделю в буфер обмена для руководителя"
+          >
+            {copiedWeek ? <Check size={14} /> : <Copy size={14} />}
+            {copiedWeek ? 'Отчет скопирован!' : 'Скопировать отчет'}
+          </button>
+
           {hasActiveFilters && (
             <button
               onClick={resetFilters}
               className="text-xs font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 px-3 py-1.5 rounded-lg flex items-center gap-1"
             >
-              <RotateCcw size={13} /> Сбросить фильтры
+              <RotateCcw size={13} /> Сбросить
             </button>
           )}
-        </div>
 
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={handleSyncAllFromProjects}
-            className="bg-emerald-600 hover:bg-emerald-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-xs transition-colors"
-            title="Собрать выполненные за эту неделю задачи, текущие работы и блокеры из всех проектов"
-          >
-            <RefreshCw size={14} /> Заполнить из проектов
-          </button>
-          <button
-            onClick={handleCopyReportText}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 border transition-colors ${
-              copiedReport
-                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
-                : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
-            }`}
-          >
-            {copiedReport ? <Check size={14} /> : <Copy size={14} />}
-            {copiedReport ? 'Скопировано!' : 'Копировать текстом'}
-          </button>
           <button
             onClick={() =>
-              setReports([
-                ...reports,
+              setReportRows([
+                ...reportRows,
                 {
                   id: Date.now(),
                   week: selectedWeek,
-                  num: '',
-                  name: '',
+                  projectNum: filters.projectNum || '',
                   stage: '',
                   deadline: '',
                   done: '',
@@ -6168,26 +6327,9 @@ function TabWeeklyReport({ reports, setReports, projects }: any) {
                 },
               ])
             }
-            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-xs"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 shadow-sm transition-colors"
           >
-            <Plus size={15} /> Добавить строку
-          </button>
-          <button
-            onClick={() =>
-              exportToCSV(
-                weekReports.map(({ id, week, ...rest }: any) => rest),
-                `Отчет_${selectedWeek}.csv`
-              )
-            }
-            className="bg-slate-100 hover:bg-slate-200/80 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
-          >
-            <FileSpreadsheet size={15} /> CSV
-          </button>
-          <button
-            onClick={() => window.print()}
-            className="bg-slate-800 hover:bg-slate-900 text-white px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
-          >
-            <Printer size={15} /> Печать / PDF
+            <Plus size={15} /> Пустая строка
           </button>
         </div>
       </div>
@@ -6197,120 +6339,102 @@ function TabWeeklyReport({ reports, setReports, projects }: any) {
           <table className="w-full text-left border-collapse text-sm">
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
-                <th className="pt-3 pb-1.5 px-3 w-24">№ Пр.</th>
-                <th className="pt-3 pb-1.5 px-3 w-36">Проект</th>
-                <th className="pt-3 pb-1.5 px-3 w-28">Стадия</th>
-                <th className="pt-3 pb-1.5 px-3 w-32">Дедлайн</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Выполнено за неделю</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[200px]">В работе</th>
-                <th className="pt-3 pb-1.5 px-3 min-w-[180px]">Проблемы / Блокеры</th>
-                <th className="pt-3 pb-1.5 px-2 w-10 no-print"></th>
+                <th className="pt-3 pb-1.5 px-3 w-28">Проект</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Стадия</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Дедлайн</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[230px]">Выполнено за неделю</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[230px]">В работе</th>
+                <th className="pt-3 pb-1.5 px-3 min-w-[210px]">Проблемы / Блокеры</th>
+                <th className="pt-3 pb-1.5 px-2 w-10"></th>
               </tr>
-              <tr className="bg-slate-50/40 border-b border-slate-200 no-print">
-                <th className="pb-2 px-2">
-                  <ColTextFilter value={filters.num} onChange={(v) => setFilters({ ...filters, num: v })} placeholder="№" />
+              <tr className="bg-slate-50/40 border-b border-slate-200">
+                <th className="pb-2.5 px-2">
+                  <ColTextFilter value={filters.projectNum} onChange={(v) => setFilters({ ...filters, projectNum: v })} placeholder="№..." />
                 </th>
-                <th className="pb-2 px-2">
-                  <ColTextFilter value={filters.name} onChange={(v) => setFilters({ ...filters, name: v })} />
+                <th className="pb-2.5 px-2">
+                  <ColTextFilter value={filters.stage} onChange={(v) => setFilters({ ...filters, stage: v })} placeholder="Стадия..." />
                 </th>
-                <th className="pb-2 px-2">
-                  <ColTextFilter value={filters.stage} onChange={(v) => setFilters({ ...filters, stage: v })} />
-                </th>
-                <th className="pb-2 px-2">
+                <th className="pb-2.5 px-2">
                   <ColTextFilter value={filters.deadline} onChange={(v) => setFilters({ ...filters, deadline: v })} placeholder="ДД/ММ/ГГГГ" />
                 </th>
-                <th className="pb-2 px-2">
+                <th className="pb-2.5 px-2">
                   <ColTextFilter value={filters.done} onChange={(v) => setFilters({ ...filters, done: v })} />
                 </th>
-                <th className="pb-2 px-2">
+                <th className="pb-2.5 px-2">
                   <ColTextFilter value={filters.inProgress} onChange={(v) => setFilters({ ...filters, inProgress: v })} />
                 </th>
-                <th className="pb-2 px-2">
+                <th className="pb-2.5 px-2">
                   <ColTextFilter value={filters.blockers} onChange={(v) => setFilters({ ...filters, blockers: v })} />
                 </th>
-                <th className="pb-2 px-2"></th>
+                <th className="pb-2.5 px-2"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {weekReports.length === 0 ? (
+              {filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-12 text-center text-slate-400">
-                    За выбранную неделю ({selectedWeek}) записей пока нет. Нажмите «Заполнить из проектов».
+                  <td colSpan={7} className="py-12 text-center text-slate-400">
+                    Записей за выбранную неделю нет. Нажмите «Сформировать из проектов» или «Пустая строка».
                   </td>
                 </tr>
               ) : (
-                weekReports.map((r: any) => {
-                  const realIndex = reports.findIndex((item: any) => item.id === r.id);
-                  const updateRow = (field: string, val: string) => {
-                    const updated = [...reports];
-                    updated[realIndex][field] = val;
-                    setReports(updated);
-                  };
-                  return (
-                    <tr key={r.id} className="group hover:bg-slate-50/70 align-top">
-                      <td className="p-2">
-                        <input
-                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
-                          value={r.num}
-                          onChange={(e) => updateRow('num', e.target.value)}
-                          placeholder="№..."
-                        />
-                      </td>
-                      <td className="p-2">
-                        <AutoTextarea
-                          value={r.name}
-                          onChange={(val) => updateRow('name', val)}
-                          placeholder="Название..."
-                        />
-                      </td>
-                      <td className="p-2">
-                        <input
-                          className="w-full px-2 py-1 text-xs font-medium text-slate-700 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
-                          value={r.stage || ''}
-                          onChange={(e) => updateRow('stage', e.target.value)}
-                          placeholder="Стадия..."
-                        />
-                      </td>
-                      <td className="p-2">
-                        <DateInput
-                          value={r.deadline || ''}
-                          onChange={(val) => updateRow('deadline', val)}
-                        />
-                      </td>
-                      <td className="p-2">
-                        <AutoTextarea
-                          value={r.done}
-                          onChange={(val) => updateRow('done', val)}
-                          placeholder="Что закрыто..."
-                          className="text-emerald-800"
-                        />
-                      </td>
-                      <td className="p-2">
-                        <AutoTextarea
-                          value={r.inProgress}
-                          onChange={(val) => updateRow('inProgress', val)}
-                          placeholder="Текущие задачи..."
-                        />
-                      </td>
-                      <td className="p-2">
-                        <AutoTextarea
-                          value={r.blockers}
-                          onChange={(val) => updateRow('blockers', val)}
-                          placeholder="Задержки / вопросы..."
-                          className="text-rose-700"
-                        />
-                      </td>
-                      <td className="p-2 text-center no-print">
-                        <button
-                          onClick={() => setReports(reports.filter((item: any) => item.id !== r.id))}
-                          className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })
+                filtered.map((r: any) => (
+                  <tr key={r.id} className="group hover:bg-slate-50/70 align-top">
+                    <td className="p-2">
+                      <input
+                        placeholder="№..."
+                        className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 focus:bg-white rounded focus:outline-none"
+                        value={r.projectNum}
+                        onChange={(e) => updateRow(r.id, 'projectNum', e.target.value)}
+                      />
+                    </td>
+                    <td className="p-2">
+                      <input
+                        placeholder="Стадия..."
+                        className="w-full px-2 py-1 text-xs font-medium text-slate-700 bg-transparent hover:bg-slate-100 focus:bg-white rounded focus:outline-none"
+                        value={r.stage || ''}
+                        onChange={(e) => updateRow(r.id, 'stage', e.target.value)}
+                      />
+                    </td>
+                    <td className="p-2">
+                      <DateInput
+                        value={r.deadline || ''}
+                        onChange={(val) => updateRow(r.id, 'deadline', val)}
+                      />
+                    </td>
+                    <td className="p-2">
+                      <AutoTextarea
+                        value={r.done}
+                        onChange={(val) => updateRow(r.id, 'done', val)}
+                        placeholder="Что сделано за неделю..."
+                        className="text-xs"
+                      />
+                    </td>
+                    <td className="p-2">
+                      <AutoTextarea
+                        value={r.inProgress}
+                        onChange={(val) => updateRow(r.id, 'inProgress', val)}
+                        placeholder="Текущие работы..."
+                        className="text-xs"
+                      />
+                    </td>
+                    <td className="p-2">
+                      <AutoTextarea
+                        value={r.blockers}
+                        onChange={(val) => updateRow(r.id, 'blockers', val)}
+                        placeholder="Активные блокеры..."
+                        className="text-xs text-rose-700"
+                      />
+                    </td>
+                    <td className="p-2 text-center">
+                      <button
+                        onClick={() => setReportRows(reportRows.filter((row: any) => row.id !== r.id))}
+                        className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </td>
+                  </tr>
+                ))
               )}
             </tbody>
           </table>
@@ -6320,17 +6444,12 @@ function TabWeeklyReport({ reports, setReports, projects }: any) {
   );
 }
 
-// === 13. ВКЛАДКА 4: БЫСТРЫЕ ЗАДАЧИ ===
+// === 13. ВКЛАДКА 4: ЗАДАЧИ ===
 
-function TabTasks({
-  tasks,
-  setTasks,
-  externalProjectFilter,
-  onClearExternalFilter,
-}: any) {
+function TabTasks({ tasks, setTasks, externalProjectFilter, onClearExternalFilter }: any) {
   const [filters, setFilters] = useState({
-    project: '',
     date: '',
+    project: '',
     desc: '',
     estDate: '',
     status: '',
@@ -6346,29 +6465,32 @@ function TabTasks({
 
   const hasActiveFilters = Object.values(filters).some(Boolean);
   const resetFilters = () =>
-    setFilters({ project: '', date: '', desc: '', estDate: '', status: '', comment: '' });
+    setFilters({ date: '', project: '', desc: '', estDate: '', status: '', comment: '' });
 
-  const filtered = tasks.filter((t: any) => {
-    return (
-      (!filters.project || (t.project || '').toLowerCase().includes(filters.project.toLowerCase())) &&
+  const filtered = tasks.filter(
+    (t: any) =>
       matchDateFilter(t.date, filters.date) &&
+      (!filters.project || (t.project || '').toLowerCase().includes(filters.project.toLowerCase())) &&
       (!filters.desc || (t.desc || '').toLowerCase().includes(filters.desc.toLowerCase())) &&
       matchDateFilter(t.estDate, filters.estDate) &&
       matchStatusFilter(t.status, filters.status) &&
       (!filters.comment || (t.comment || '').toLowerCase().includes(filters.comment.toLowerCase()))
-    );
-  });
+  );
+
+  const updateTask = (id: any, field: string, value: string) => {
+    setTasks(tasks.map((t: any) => (t.id === id ? { ...t, [field]: value } : t)));
+  };
 
   return (
     <div className="space-y-4">
-      <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-white p-4 rounded-xl border border-slate-200/80 shadow-sm">
         <div>
-          <h2 className="text-lg font-semibold text-slate-800">Оперативные задачи</h2>
+          <h2 className="text-lg font-semibold text-slate-800">Оперативные задачи и поручения</h2>
           <p className="text-xs text-slate-500">
-            Просроченные дедлайны задач автоматически подсвечиваются красным
+            Просроченные и горящие дедлайны автоматически подсвечиваются и попадают в календарь
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex items-center gap-2">
           {hasActiveFilters && (
             <button
               onClick={resetFilters}
@@ -6382,8 +6504,8 @@ function TabTasks({
               setTasks([
                 {
                   id: Date.now(),
+                  date: filters.date || getTodayDMY(),
                   project: filters.project || '',
-                  date: getTodayDMY(),
                   desc: '',
                   estDate: '',
                   status: 'в работе',
@@ -6392,7 +6514,7 @@ function TabTasks({
                 ...tasks,
               ])
             }
-            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 shadow-sm whitespace-nowrap"
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-1.5 rounded-lg text-sm font-medium flex items-center gap-1.5 shadow-sm transition-colors whitespace-nowrap"
           >
             <Plus size={16} /> Новая задача
           </button>
@@ -6404,20 +6526,20 @@ function TabTasks({
           <table className="w-full text-left border-collapse text-sm">
             <thead>
               <tr className="bg-slate-50/80 border-b border-slate-200 text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                <th className="pt-3 pb-1.5 px-3 w-36">Дата</th>
                 <th className="pt-3 pb-1.5 px-3 w-28">Проект</th>
-                <th className="pt-3 pb-1.5 px-3 w-36">Дата постановки</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[260px]">Описание задачи</th>
-                <th className="pt-3 pb-1.5 px-3 w-36">Дедлайн</th>
+                <th className="pt-3 pb-1.5 px-3 w-36">Срок (Дедлайн)</th>
                 <th className="pt-3 pb-1.5 px-3 w-44">Статус</th>
                 <th className="pt-3 pb-1.5 px-3 min-w-[200px]">Комментарий</th>
                 <th className="pt-3 pb-1.5 px-2 w-10"></th>
               </tr>
               <tr className="bg-slate-50/40 border-b border-slate-200">
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.project} onChange={(v) => setFilters({ ...filters, project: v })} placeholder="№..." />
+                  <ColTextFilter value={filters.date} onChange={(v) => setFilters({ ...filters, date: v })} placeholder="ДД/ММ/ГГГГ" />
                 </th>
                 <th className="pb-2.5 px-2">
-                  <ColTextFilter value={filters.date} onChange={(v) => setFilters({ ...filters, date: v })} placeholder="ДД/ММ/ГГГГ" />
+                  <ColTextFilter value={filters.project} onChange={(v) => setFilters({ ...filters, project: v })} placeholder="№..." />
                 </th>
                 <th className="pb-2.5 px-2">
                   <ColTextFilter value={filters.desc} onChange={(v) => setFilters({ ...filters, desc: v })} />
@@ -6428,7 +6550,7 @@ function TabTasks({
                 <th className="pb-2.5 px-2">
                   <ColSelectFilter
                     value={filters.status}
-                    options={['в работе', 'выполнена', 'на паузе', 'передано']}
+                    options={['в работе', 'выполнена', 'передано', 'на паузе']}
                     onChange={(v) => setFilters({ ...filters, status: v })}
                   />
                 </th>
@@ -6447,79 +6569,63 @@ function TabTasks({
                 </tr>
               ) : (
                 filtered.map((t: any) => {
-                  const updateTask = (field: string, val: string) => {
-                    setTasks(tasks.map((item: any) => (item.id === t.id ? { ...item, [field]: val } : item)));
-                  };
                   const isCompleted = ['выполнена', 'выполнено'].includes((t.status || '').toLowerCase());
                   const urgency = !isCompleted ? getDeadlineUrgency(t.estDate) : null;
 
                   return (
                     <tr
                       key={t.id}
-                      className={`group align-top transition-colors ${
+                      className={`group transition-colors align-top ${
                         urgency === 'overdue'
                           ? 'bg-rose-50/70 hover:bg-rose-100/60'
                           : urgency === 'soon'
-                          ? 'bg-amber-50/50 hover:bg-amber-100/50'
+                          ? 'bg-amber-50/60 hover:bg-amber-100/50'
                           : 'hover:bg-slate-50/70'
                       }`}
                     >
                       <td className="p-2">
-                        <input
-                          placeholder="№..."
-                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 rounded focus:bg-white focus:outline-none"
-                          value={t.project}
-                          onChange={(e) => updateTask('project', e.target.value)}
-                        />
+                        <DateInput value={t.date} onChange={(val) => updateTask(t.id, 'date', val)} />
                       </td>
                       <td className="p-2">
-                        <DateInput
-                          value={t.date}
-                          onChange={(val) => updateTask('date', val)}
+                        <input
+                          placeholder="№..."
+                          className="w-full px-2 py-1 font-semibold text-indigo-600 bg-transparent hover:bg-slate-100 focus:bg-white rounded focus:outline-none"
+                          value={t.project}
+                          onChange={(e) => updateTask(t.id, 'project', e.target.value)}
                         />
                       </td>
                       <td className="p-2">
                         <AutoTextarea
                           value={t.desc}
-                          onChange={(val) => updateTask('desc', val)}
+                          onChange={(val) => updateTask(t.id, 'desc', val)}
                           placeholder="Что нужно сделать..."
-                          className={isCompleted ? 'line-through text-slate-400' : ''}
+                          className="font-medium"
                         />
                       </td>
                       <td className="p-2">
-                        <DateInput
-                          value={t.estDate}
-                          onChange={(val) => updateTask('estDate', val)}
-                          className={
-                            urgency === 'overdue'
-                              ? 'text-rose-700 font-bold'
-                              : urgency === 'soon'
-                              ? 'text-amber-800 font-semibold'
-                              : ''
-                          }
-                        />
+                        <DateInput value={t.estDate} onChange={(val) => updateTask(t.id, 'estDate', val)} />
                       </td>
                       <td className="p-2">
                         <StatusPill
                           value={t.status}
-                          options={['в работе', 'выполнена', 'на паузе', 'передано']}
-                          onChange={(val) => updateTask('status', val)}
+                          options={['в работе', 'выполнена', 'передано', 'на паузе']}
+                          onChange={(val) => updateTask(t.id, 'status', val)}
                         />
                       </td>
                       <td className="p-2">
                         <AutoTextarea
                           value={t.comment}
-                          onChange={(val) => updateTask('comment', val)}
-                          placeholder="Комментарий..."
-                          className="text-xs text-slate-600"
+                          onChange={(val) => updateTask(t.id, 'comment', val)}
+                          placeholder="Примечание..."
+                          className="text-slate-600 text-xs"
                         />
                       </td>
                       <td className="p-2 text-center">
                         <button
-                          onClick={() => setTasks(tasks.filter((item: any) => item.id !== t.id))}
+                          onClick={() => setTasks(tasks.filter((task: any) => task.id !== t.id))}
                           className="text-slate-300 hover:text-rose-500 p-1 opacity-0 group-hover:opacity-100 transition-opacity"
                         >
-                          <Trash2 size={14} />
+                          <Trash2 size={15} />
                         </button>
                       </td>
                     </tr>
@@ -6534,83 +6640,113 @@ function TabTasks({
   );
 }
 
-// === 14. ГЛАВНОЕ ПРИЛОЖЕНИЕ + СИНХРОНИЗАЦИЯ С GOOGLE DRIVE ===
+// === 14. ГЛАВНЫЙ КОМПОНЕНТ ПРИЛОЖЕНИЯ (С GOOGLE DRIVE СИНХРОНИЗАЦИЕЙ) ===
 
 export default function App() {
   const [activeTab, setActiveTab] = useState(0);
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [meetings, setMeetings, meetingsLoaded] = useIndexedStorage<any[]>('sup_meetings_v2', []);
+  const [projects, setProjects, projectsLoaded] = useIndexedStorage<any[]>('sup_projects_v2', []);
+  const [activeProjectId, setActiveProjectId, activeProjLoaded] = useIndexedStorage<string | null>(
+    'sup_active_proj_v2',
+    null
+  );
+  const [reportRows, setReportRows, reportLoaded] = useIndexedStorage<any[]>('sup_report_v2', []);
+  const [tasks, setTasks, tasksLoaded] = useIndexedStorage<any[]>('sup_tasks_v2', []);
+  const [calendarEvents, setCalendarEvents, calendarLoaded] = useIndexedStorage<any[]>(
+    'sup_calendar_events_v1',
+    []
+  );
+
+  // Состояние Google Drive синхронизации
+  const [driveToken, setDriveToken] = useState<string | null>(() => {
+    try {
+      const saved = sessionStorage.getItem('sup_gdrive_token');
+      const exp = Number(sessionStorage.getItem('sup_gdrive_exp') || 0);
+      if (saved && exp > Date.now() + 30000) return saved;
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+  const [driveSyncStatus, setDriveSyncStatus] = useState<'idle' | 'syncing' | 'synced' | 'error'>('idle');
+  const [lastDriveSyncTime, setLastDriveSyncTime] = useState<string | null>(null);
+  const [driveErrorMsg, setDriveErrorMsg] = useState<string | null>(null);
+  const driveFileIdRef = useRef<string | null>(null);
+  const skipNextAutoUploadRef = useRef<boolean>(false);
 
   const [lightboxState, setLightboxState] = useState<{
     images: string[];
-    initialIndex: number;
+    index: number;
     onSaveEdited?: (idx: number, newUrl: string) => void;
   } | null>(null);
 
-  const [projects, setProjects, loadedProjects] = useIndexedStorage<any[]>('sup_projects_v2', []);
-  const [activeProjectId, setActiveProjectId] = useIndexedStorage<string | null>('sup_active_id_v2', null);
-  const [meetings, setMeetings, loadedMeetings] = useIndexedStorage<any[]>('sup_meetings_v2', []);
-  const [reports, setReports, loadedReports] = useIndexedStorage<any[]>('sup_reports_v2', []);
-  const [tasks, setTasks, loadedTasks] = useIndexedStorage<any[]>('sup_tasks_v2', []);
-  const [calendarEvents, setCalendarEvents, loadedEvents] = useIndexedStorage<any[]>('sup_calendar_events_v1', []);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [externalProjectFilter, setExternalProjectFilter] = useState('');
+  const [externalProjectSubTab, setExternalProjectSubTab] = useState<
+    'tasks' | 'remarks' | 'revisions' | 'docs' | 'related' | null
+  >(null);
+  const [syncToast, setSyncToast] = useState<string | null>(null);
+  const [dueAlarmToast, setDueAlarmToast] = useState<any | null>(null);
+  const [notifPermission, setNotifPermission] = useState<string>(() =>
+    typeof Notification !== 'undefined' ? Notification.permission : 'default'
+  );
 
-  // Состояния Google Drive
-  const [googleToken, setGoogleToken] = useState<string | null>(null);
-  const [cloudFileId, setCloudFileId] = useState<string | null>(null);
-  const [syncStatus, setSyncStatus] = useState<'disconnected' | 'syncing' | 'synced' | 'error'>('disconnected');
-  const [lastSyncTime, setLastSyncTime] = useState<string | null>(null);
-  const [gisReady, setGisReady] = useState(false);
-  const tokenClientRef = useRef<any>(null);
-  const isRemoteApplyingRef = useRef(false);
-
-  const [crossTabProjectFilter, setCrossTabProjectFilter] = useState<string>('');
-  const [crossProjectSubTab, setCrossProjectSubTab] = useState<'tasks' | 'remarks' | 'revisions' | 'docs' | 'related' | null>(null);
-
-  const isAllLoaded = loadedProjects && loadedMeetings && loadedReports && loadedTasks && loadedEvents;
+  const allLoaded =
+    meetingsLoaded &&
+    projectsLoaded &&
+    activeProjLoaded &&
+    reportLoaded &&
+    tasksLoaded &&
+    calendarLoaded;
 
   const showToast = useCallback((msg: string) => {
-    setToastMessage(msg);
-    setTimeout(() => setToastMessage(null), 4000);
+    setSyncToast(msg);
+    setTimeout(() => setSyncToast(null), 3500);
   }, []);
 
   // Загрузка скрипта Google Identity Services
   useEffect(() => {
-    const existingScript = document.getElementById('google-gis-script');
-    if (existingScript) {
-      if ((window as any).google?.accounts?.oauth2) {
-        setGisReady(true);
-      }
-      return;
-    }
+    if (document.getElementById('google-gsi-script')) return;
     const script = document.createElement('script');
-    script.id = 'google-gis-script';
+    script.id = 'google-gsi-script';
     script.src = 'https://accounts.google.com/gsi/client';
     script.async = true;
     script.defer = true;
-    script.onload = () => setGisReady(true);
     document.body.appendChild(script);
   }, []);
 
-  // Поиск или создание файла в Google Drive
-  const findOrCreateCloudFile = useCallback(async (token: string): Promise<string | null> => {
-    try {
-      const q = encodeURIComponent(`name='${CLOUD_DB_FILENAME}' and trashed=false`);
-      const searchRes = await fetch(
-        `https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&fields=files(id,name,modifiedTime)`,
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      if (searchRes.status === 401) {
-        setGoogleToken(null);
-        setSyncStatus('disconnected');
-        return null;
-      }
-      const searchData = await searchRes.json();
-      if (searchData.files && searchData.files.length > 0) {
-        return searchData.files[0].id;
-      }
+  // Поиск или создание файла базы данных в Google Drive
+  const findOrCreateDriveDbFile = useCallback(async (token: string): Promise<string> => {
+    if (driveFileIdRef.current) return driveFileIdRef.current;
 
-      // Создаём новый пустой файл в корне Google Drive
-      const createRes = await fetch('https://www.googleapis.com/drive/v3/files', {
+    const query = encodeURIComponent(
+      `name = '${CLOUD_DB_FILENAME}' and trashed = false`
+    );
+    const searchRes = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id,name,modifiedTime)&spaces=drive`,
+      {
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
+
+    if (!searchRes.ok) {
+      if (searchRes.status === 401) {
+        setDriveToken(null);
+        sessionStorage.removeItem('sup_gdrive_token');
+      }
+      throw new Error(`Ошибка доступа к Google Drive (${searchRes.status})`);
+    }
+
+    const searchData = await searchRes.json();
+    if (searchData.files && searchData.files.length > 0) {
+      driveFileIdRef.current = searchData.files[0].id;
+      return searchData.files[0].id;
+    }
+
+    // Создаём новый файл на Google Drive
+    const createRes = await fetch(
+      'https://www.googleapis.com/drive/v3/files?fields=id',
+      {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -6620,195 +6756,208 @@ export default function App() {
           name: CLOUD_DB_FILENAME,
           mimeType: 'application/json',
         }),
-      });
-      const created = await createRes.json();
-      return created.id || null;
-    } catch (err) {
-      console.error('Google Drive find/create error:', err);
-      return null;
-    }
+      }
+    );
+    if (!createRes.ok) throw new Error('Не удалось создать файл базы на Google Drive');
+    const created = await createRes.json();
+    driveFileIdRef.current = created.id;
+    return created.id;
   }, []);
 
-  // Загрузка данных из Google Drive
+  // Загрузка данных С Google Drive (при входе или по кнопке)
   const pullFromGoogleDrive = useCallback(
-    async (token: string, explicitFileId?: string) => {
-      setSyncStatus('syncing');
+    async (token: string, silent = false) => {
       try {
-        const fileId = explicitFileId || (await findOrCreateCloudFile(token));
-        if (!fileId) {
-          setSyncStatus('error');
-          return;
-        }
-        setCloudFileId(fileId);
+        setDriveSyncStatus('syncing');
+        setDriveErrorMsg(null);
+        const fileId = await findOrCreateDriveDbFile(token);
 
-        const contentRes = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`, {
-          headers: { Authorization: `Bearer ${token}` },
+        const downloadRes = await fetch(
+          `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          }
+        );
+
+        if (!downloadRes.ok) throw new Error('Ошибка чтения файла из Google Drive');
+        const text = await downloadRes.text();
+
+        if (text && text.trim()) {
+          const parsed = JSON.parse(text);
+          const hasCloudData =
+            (parsed.projects && parsed.projects.length > 0) ||
+            (parsed.meetings && parsed.meetings.length > 0) ||
+            (parsed.tasks && parsed.tasks.length > 0) ||
+            (parsed.reportRows && parsed.reportRows.length > 0) ||
+            (parsed.calendarEvents && parsed.calendarEvents.length > 0);
+
+          if (hasCloudData) {
+            skipNextAutoUploadRef.current = true;
+            if (parsed.meetings) setMeetings(parsed.meetings);
+            if (parsed.projects) setProjects(parsed.projects);
+            if (parsed.activeProjectId !== undefined) setActiveProjectId(parsed.activeProjectId);
+            if (parsed.reportRows) setReportRows(parsed.reportRows);
+            if (parsed.tasks) setTasks(parsed.tasks);
+            if (parsed.calendarEvents) setCalendarEvents(parsed.calendarEvents);
+            if (!silent) showToast('Данные загружены из Google Drive ✓');
+          } else {
+            // Файл в облаке пустой (только что создан) — отправляем локальные данные туда
+            await pushToGoogleDrive(token, true);
+          }
+        } else {
+          await pushToGoogleDrive(token, true);
+        }
+
+        const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        setLastDriveSyncTime(nowTime);
+        setDriveSyncStatus('synced');
+      } catch (err: any) {
+        console.error('Drive pull error:', err);
+        setDriveSyncStatus('error');
+        setDriveErrorMsg(err?.message || 'Ошибка синхронизации');
+      }
+    },
+    [findOrCreateDriveDbFile, setMeetings, setProjects, setActiveProjectId, setReportRows, setTasks, setCalendarEvents, showToast]
+  );
+
+  // Сохранение данных НА Google Drive
+  const pushToGoogleDrive = useCallback(
+    async (token: string, silent = true) => {
+      try {
+        setDriveSyncStatus('syncing');
+        setDriveErrorMsg(null);
+        const fileId = await findOrCreateDriveDbFile(token);
+
+        const payload = JSON.stringify({
+          updatedAt: new Date().toISOString(),
+          meetings,
+          projects,
+          activeProjectId,
+          reportRows,
+          tasks,
+          calendarEvents,
         });
 
-        if (contentRes.status === 401) {
-          setGoogleToken(null);
-          setSyncStatus('disconnected');
-          return;
-        }
-
-        const rawText = await contentRes.text();
-        if (rawText && rawText.trim().startsWith('{')) {
-          const parsed = JSON.parse(rawText);
-          isRemoteApplyingRef.current = true;
-          if (Array.isArray(parsed.projects)) setProjects(parsed.projects);
-          if (parsed.activeProjectId !== undefined) setActiveProjectId(parsed.activeProjectId);
-          if (Array.isArray(parsed.meetings)) setMeetings(parsed.meetings);
-          if (Array.isArray(parsed.reports)) setReports(parsed.reports);
-          if (Array.isArray(parsed.tasks)) setTasks(parsed.tasks);
-          if (Array.isArray(parsed.calendarEvents)) setCalendarEvents(parsed.calendarEvents);
-          setTimeout(() => {
-            isRemoteApplyingRef.current = false;
-          }, 400);
-          showToast('Данные загружены из Google Drive');
-        } else {
-          // Файл только что создан — выгружаем текущую локальную базу в облако
-          const payload = JSON.stringify({
-            updatedAt: new Date().toISOString(),
-            projects,
-            activeProjectId,
-            meetings,
-            reports,
-            tasks,
-            calendarEvents,
-          });
-          await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
+        const uploadRes = await fetch(
+          `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+          {
             method: 'PATCH',
             headers: {
               Authorization: `Bearer ${token}`,
               'Content-Type': 'application/json',
             },
             body: payload,
-          });
-          showToast('Локальная база загружена на Google Drive');
+          }
+        );
+
+        if (!uploadRes.ok) {
+          if (uploadRes.status === 401) {
+            setDriveToken(null);
+            sessionStorage.removeItem('sup_gdrive_token');
+          }
+          throw new Error(`Ошибка сохранения в Drive (${uploadRes.status})`);
         }
 
-        const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        setLastSyncTime(nowStr);
-        setSyncStatus('synced');
-      } catch (err) {
-        console.error('Google Drive pull error:', err);
-        setSyncStatus('error');
+        const nowTime = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+        setLastDriveSyncTime(nowTime);
+        setDriveSyncStatus('synced');
+        if (!silent) showToast('База сохранена в Google Drive ✓');
+      } catch (err: any) {
+        console.error('Drive push error:', err);
+        setDriveSyncStatus('error');
+        setDriveErrorMsg(err?.message || 'Ошибка сохранения');
       }
     },
-    [findOrCreateCloudFile, projects, activeProjectId, meetings, reports, tasks, calendarEvents, setProjects, setActiveProjectId, setMeetings, setReports, setTasks, setCalendarEvents, showToast]
+    [findOrCreateDriveDbFile, meetings, projects, activeProjectId, reportRows, tasks, calendarEvents, showToast]
   );
 
-  // Сохранение данных в Google Drive
-  const pushToGoogleDrive = useCallback(
-    async (token: string, fileId: string) => {
-      setSyncStatus('syncing');
-      try {
-        const payload = JSON.stringify({
-          updatedAt: new Date().toISOString(),
-          projects,
-          activeProjectId,
-          meetings,
-          reports,
-          tasks,
-          calendarEvents,
-        });
-
-        const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
-          method: 'PATCH',
-          headers: {
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: payload,
-        });
-
-        if (res.status === 401) {
-          setGoogleToken(null);
-          setSyncStatus('disconnected');
-          showToast('Сессия Google Drive истекла — нажмите «Подключить Drive» заново');
-          return;
-        }
-
-        if (!res.ok) {
-          setSyncStatus('error');
-          return;
-        }
-
-        const nowStr = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        setLastSyncTime(nowStr);
-        setSyncStatus('synced');
-      } catch (err) {
-        console.error('Google Drive push error:', err);
-        setSyncStatus('error');
-      }
-    },
-    [projects, activeProjectId, meetings, reports, tasks, calendarEvents, showToast]
-  );
-
-  // Автосохранение с задержкой 2.5 секунды при любых изменениях
+  // Автоматическая отправка изменений на Google Drive с задержкой 2.5 сек
   useEffect(() => {
-    if (!googleToken || !cloudFileId || !isAllLoaded || isRemoteApplyingRef.current) return;
-    const timer = setTimeout(() => {
-      pushToGoogleDrive(googleToken, cloudFileId);
-    }, 2500);
-    return () => clearTimeout(timer);
-  }, [projects, activeProjectId, meetings, reports, tasks, calendarEvents, googleToken, cloudFileId, isAllLoaded, pushToGoogleDrive]);
-
-  const handleConnectGoogleDrive = () => {
-    if (!gisReady || !(window as any).google?.accounts?.oauth2) {
-      showToast('Библиотека Google ещё загружается, попробуйте через 2 секунды');
+    if (!driveToken || !allLoaded) return;
+    if (skipNextAutoUploadRef.current) {
+      skipNextAutoUploadRef.current = false;
       return;
     }
-    if (!tokenClientRef.current) {
-      tokenClientRef.current = (window as any).google.accounts.oauth2.initTokenClient({
-        client_id: GOOGLE_CLIENT_ID,
-        scope: GOOGLE_DRIVE_SCOPE,
-        callback: (resp: any) => {
-          if (resp.error) {
-            showToast(`Ошибка входа Google: ${resp.error}`);
-            setSyncStatus('error');
-            return;
-          }
-          if (resp.access_token) {
-            setGoogleToken(resp.access_token);
-            pullFromGoogleDrive(resp.access_token);
-          }
-        },
-      });
+
+    const timer = setTimeout(() => {
+      pushToGoogleDrive(driveToken, true);
+    }, 2500);
+
+    return () => clearTimeout(timer);
+  }, [driveToken, allLoaded, meetings, projects, activeProjectId, reportRows, tasks, calendarEvents, pushToGoogleDrive]);
+
+  // Авторизация в Google Drive через OAuth2 popup
+  const handleConnectGoogleDrive = () => {
+    const googleObj = (window as any).google;
+    if (!googleObj?.accounts?.oauth2) {
+      alert('Скрипт авторизации Google еще загружается. Попробуйте через пару секунд.');
+      return;
     }
-    tokenClientRef.current.requestAccessToken({ prompt: '' });
+
+    const tokenClient = googleObj.accounts.oauth2.initTokenClient({
+      client_id: GOOGLE_CLIENT_ID,
+      scope: GOOGLE_DRIVE_SCOPE,
+      callback: (response: any) => {
+        if (response.error) {
+          setDriveSyncStatus('error');
+          setDriveErrorMsg(response.error_description || response.error);
+          return;
+        }
+        if (response.access_token) {
+          const expiresInSec = Number(response.expires_in || 3500);
+          setDriveToken(response.access_token);
+          try {
+            sessionStorage.setItem('sup_gdrive_token', response.access_token);
+            sessionStorage.setItem('sup_gdrive_exp', String(Date.now() + expiresInSec * 1000));
+          } catch {
+            // ignore
+          }
+          pullFromGoogleDrive(response.access_token, false);
+        }
+      },
+    });
+
+    tokenClient.requestAccessToken({ prompt: '' });
   };
 
   const handleDisconnectGoogleDrive = () => {
-    setGoogleToken(null);
-    setCloudFileId(null);
-    setSyncStatus('disconnected');
-    showToast('Google Drive отключён. Данные продолжают сохраняться локально.');
+    setDriveToken(null);
+    driveFileIdRef.current = null;
+    setDriveSyncStatus('idle');
+    setLastDriveSyncTime(null);
+    try {
+      sessionStorage.removeItem('sup_gdrive_token');
+      sessionStorage.removeItem('sup_gdrive_exp');
+    } catch {
+      // ignore
+    }
+    showToast('Google Drive отключён');
   };
 
-  // Горячие клавиши Ctrl+K / Cmd+K для глобального поиска
+  // Горячая клавиша Ctrl+K / Cmd+K для глобального поиска
   useEffect(() => {
-    const handleGlobalKey = (e: KeyboardEvent) => {
+    const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setIsSearchOpen((prev) => !prev);
-      } else if (e.key === 'Escape' && isSearchOpen) {
-        setIsSearchOpen(false);
       }
     };
-    window.addEventListener('keydown', handleGlobalKey);
-    return () => window.removeEventListener('keydown', handleGlobalKey);
-  }, [isSearchOpen]);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
-  // Фоновая проверка времени напоминаний
+  // Фоновый таймер проверки напоминаний из календаря (каждые 30 секунд)
   useEffect(() => {
-    if (!isAllLoaded) return;
-    const checkReminders = () => {
-      const todayStr = getTodayDMY();
-      const now = new Date();
-      const currentHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    if (!allLoaded) return;
 
-      let triggeredTitle: string | null = null;
+    const checkAlarms = () => {
+      const now = new Date();
+      const todayStr = getTodayDMY();
+      const currentHHMM = `${String(now.getHours()).padStart(2, '0')}:${String(
+        now.getMinutes()
+      ).padStart(2, '0')}`;
+
+      let triggeredEvent: any = null;
       const updated = calendarEvents.map((ev: any) => {
         if (
           !ev.notified &&
@@ -6816,70 +6965,92 @@ export default function App() {
           ev.time &&
           ev.time <= currentHHMM
         ) {
-          triggeredTitle = `${ev.time} — ${ev.projectNum ? `#${ev.projectNum}: ` : ''}${ev.title}`;
+          triggeredEvent = ev;
           return { ...ev, notified: true };
         }
         return ev;
       });
 
-      if (triggeredTitle) {
+      if (triggeredEvent) {
         setCalendarEvents(updated);
+        setDueAlarmToast(triggeredEvent);
         playNotificationChime();
-        showToast(`🔔 Напоминание: ${triggeredTitle}`);
-        if ('Notification' in window && Notification.permission === 'granted') {
-          new Notification('SUP Project Tracker', { body: triggeredTitle });
+
+        if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+          try {
+            new Notification(
+              `SUP Tracker${triggeredEvent.projectNum ? ` (#${triggeredEvent.projectNum})` : ''}`,
+              {
+                body: `${triggeredEvent.time ? `[${triggeredEvent.time}] ` : ''}${triggeredEvent.title}`,
+              }
+            );
+          } catch {
+            // ignore notification error
+          }
         }
       }
     };
 
-    checkReminders();
-    const timer = setInterval(checkReminders, 30000);
+    checkAlarms();
+    const timer = setInterval(checkAlarms, 30000);
     return () => clearInterval(timer);
-  }, [calendarEvents, isAllLoaded, setCalendarEvents, showToast]);
+  }, [allLoaded, calendarEvents, setCalendarEvents]);
 
-  const handleNavigateWithFilter = (tabIndex: number, projectNum: string) => {
-    setCrossTabProjectFilter(projectNum);
-    setActiveTab(tabIndex);
-  };
-
-  const handleOpenProject = (
-    projectId: string,
-    targetSubTab?: 'tasks' | 'remarks' | 'revisions' | 'docs' | 'related'
-  ) => {
-    setActiveProjectId(projectId);
-    if (targetSubTab) {
-      setCrossProjectSubTab(targetSubTab);
+  const requestDesktopNotifications = async () => {
+    if (typeof Notification === 'undefined') {
+      alert('Ваш браузер не поддерживает системные уведомления.');
+      return;
     }
-    setActiveTab(2);
+    const res = await Notification.requestPermission();
+    setNotifPermission(res);
+    if (res === 'granted') {
+      showToast('Системные уведомления браузера включены');
+    }
   };
+
+  const handleOpenProjectFromSummary = useCallback(
+    (projectId: string, subTab?: 'tasks' | 'remarks' | 'revisions' | 'docs' | 'related') => {
+      setActiveProjectId(projectId);
+      if (subTab) {
+        setExternalProjectSubTab(subTab);
+      }
+      setActiveTab(2);
+    },
+    [setActiveProjectId]
+  );
+
+  const handleNavigateWithFilter = useCallback((tabId: number, filterNum?: string) => {
+    if (filterNum !== undefined) {
+      setExternalProjectFilter(filterNum);
+    }
+    setActiveTab(tabId);
+  }, []);
 
   const handleSyncSingleProjectToReport = (project: any) => {
-    const currentWeek = getCurrentISOWeek();
-    const summary = buildProjectReportSummary(project, currentWeek);
-    const existingIdx = reports.findIndex(
-      (r: any) => r.week === currentWeek && (r.num || '').trim() === (project.num || '').trim()
+    const targetWeek = getCurrentISOWeek();
+    const summary = buildProjectReportSummary(project, targetWeek);
+    const existingIdx = reportRows.findIndex(
+      (r: any) => r.week === targetWeek && (r.projectNum || '').trim() === (project.num || '').trim()
     );
 
-    if (existingIdx >= 0) {
-      const updated = [...reports];
+    if (existingIdx !== -1) {
+      const updated = [...reportRows];
       updated[existingIdx] = {
         ...updated[existingIdx],
-        name: project.name || updated[existingIdx].name,
-        stage: summary.stage || updated[existingIdx].stage,
-        deadline: summary.deadline || updated[existingIdx].deadline,
+        stage: summary.stage || updated[existingIdx].stage || '',
+        deadline: summary.deadline || updated[existingIdx].deadline || '',
         done: summary.done,
         inProgress: summary.inProgress,
         blockers: summary.blockers,
       };
-      setReports(updated);
+      setReportRows(updated);
     } else {
-      setReports([
-        ...reports,
+      setReportRows([
+        ...reportRows,
         {
           id: Date.now(),
-          week: currentWeek,
-          num: project.num,
-          name: project.name || '',
+          week: targetWeek,
+          projectNum: project.num,
           stage: summary.stage,
           deadline: summary.deadline,
           done: summary.done,
@@ -6888,92 +7059,95 @@ export default function App() {
         },
       ]);
     }
-    showToast(`Отчет по проекту #${project.num} за неделю ${currentWeek} обновлен!`);
+
+    showToast(`Проект ${project.num} обновлен в отчете за ${targetWeek}`);
   };
 
-  const handleBackup = () => {
-    const data = JSON.stringify({ projects, activeProjectId, meetings, reports, tasks, calendarEvents }, null, 2);
-    const blob = new Blob([data], { type: 'application/json' });
+  const handleBackupSave = () => {
+    const backup = {
+      exportedAt: new Date().toISOString(),
+      meetings,
+      projects,
+      activeProjectId,
+      reportRows,
+      tasks,
+      calendarEvents,
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
-    link.download = `SUP_Database_${new Date().toISOString().split('T')[0]}.json`;
+    link.download = `SUP_Tracker_Backup_${new Date().toISOString().split('T')[0]}.json`;
     link.click();
-    showToast('Резервная копия сохранена на компьютер!');
   };
 
-  const handleRestore = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleBackupLoad = (e: any) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = (ev: any) => {
+    reader.onload = (event: any) => {
       try {
-        const parsed = JSON.parse(ev.target.result);
+        const parsed = JSON.parse(event.target.result);
+        if (parsed.meetings) setMeetings(parsed.meetings);
         if (parsed.projects) setProjects(parsed.projects);
         if (parsed.activeProjectId !== undefined) setActiveProjectId(parsed.activeProjectId);
-        if (parsed.meetings) setMeetings(parsed.meetings);
-        if (parsed.reports) setReports(parsed.reports);
+        if (parsed.reportRows) setReportRows(parsed.reportRows);
         if (parsed.tasks) setTasks(parsed.tasks);
         if (parsed.calendarEvents) setCalendarEvents(parsed.calendarEvents);
-        showToast('База данных успешно восстановлена из файла!');
+        showToast('Резервная копия успешно восстановлена');
       } catch {
         alert('Ошибка при чтении файла резервной копии.');
       }
     };
     reader.readAsText(file);
-    e.target.value = '';
   };
 
-  const activeBlockersTotal = projects.reduce(
-    (acc: number, p: any) => acc + (p.blockers || []).filter((b: any) => !b.resolved).length,
-    0
-  );
-  const openTasksTotal = tasks.filter(
-    (t: any) => !['выполнена', 'выполнено'].includes((t.status || '').toLowerCase())
-  ).length;
-  const openMeetingsTotal = meetings.filter(
-    (m: any) => (m.status || '').toLowerCase() !== 'исправлено'
-  ).length;
+  const handleExportActiveTabCSV = () => {
+    if (activeTab === 1) exportToCSV(meetings, 'Meetings.csv');
+    if (activeTab === 2) {
+      const p = projects.find((item: any) => item.id === activeProjectId);
+      if (p) exportToCSV(p.tasks || [], `Project_${p.num}_Tasks.csv`);
+    }
+    if (activeTab === 3) exportToCSV(reportRows, 'Weekly_Report.csv');
+    if (activeTab === 4) exportToCSV(tasks, 'Tasks.csv');
+  };
 
   const tabs = [
-    { id: 0, title: 'Сводка и Календарь', icon: CalendarDays, badge: 0 },
-    { id: 1, title: 'Встречи', icon: Users, badge: openMeetingsTotal },
-    { id: 2, title: 'Статус проекта', icon: FolderKanban, badge: activeBlockersTotal },
-    { id: 3, title: 'Еженедельный отчет', icon: FileSpreadsheet, badge: 0 },
-    { id: 4, title: 'Задачи', icon: CheckSquare, badge: openTasksTotal },
+    { id: 0, label: 'Сводка и Календарь', icon: CalendarDays },
+    { id: 1, label: 'Встречи', icon: Users, badge: meetings.length },
+    { id: 2, label: 'Статус проекта', icon: FolderKanban, badge: projects.length },
+    { id: 3, label: 'Отчет', icon: FileSpreadsheet },
+    { id: 4, label: 'Задачи', icon: CheckSquare, badge: tasks.length },
   ];
 
-  const requestDesktopNotifications = () => {
-    if (!('Notification' in window)) {
-      showToast('Ваш браузер не поддерживает системные уведомления');
-      return;
-    }
-    Notification.requestPermission().then((perm) => {
-      if (perm === 'granted') {
-        showToast('Уведомления в браузере включены!');
-      } else {
-        showToast('Доступ к уведомлениям отклонен в настройках браузера');
-      }
-    });
-  };
-
-  if (!isAllLoaded) {
-    return (
-      <div className="min-h-screen bg-slate-100/70 flex items-center justify-center text-slate-500 text-sm">
-        Загрузка базы данных SUP...
-      </div>
-    );
-  }
-
   return (
-    <div className="min-h-screen bg-slate-100/70 text-slate-800 font-sans pb-16">
-      <style>{`
-        @media print {
-          .no-print { display: none !important; }
-          body { background: white !important; }
-          table { font-size: 11px !important; }
-          textarea { border: none !important; resize: none !important; }
-        }
-      `}</style>
+    <div className="min-h-screen bg-[#F8FAFC] text-slate-800 flex flex-col font-sans">
+      {syncToast && (
+        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4 py-2.5 rounded-xl shadow-lg text-xs font-medium flex items-center gap-2 border border-slate-700">
+          <CheckCircle2 size={16} className="text-emerald-400" />
+          {syncToast}
+        </div>
+      )}
+
+      {dueAlarmToast && (
+        <div className="fixed top-20 right-5 z-50 bg-indigo-900 text-white p-4 rounded-2xl shadow-2xl border border-indigo-400 max-w-sm flex items-start gap-3">
+          <BellRing size={22} className="text-amber-300 shrink-0 mt-0.5" />
+          <div className="flex-grow min-w-0">
+            <div className="text-[11px] font-bold uppercase tracking-wider text-indigo-200">
+              Напоминание • {dueAlarmToast.time}
+            </div>
+            <div className="text-sm font-semibold mt-0.5">
+              {dueAlarmToast.projectNum ? `#${dueAlarmToast.projectNum} — ` : ''}
+              {dueAlarmToast.title}
+            </div>
+          </div>
+          <button
+            onClick={() => setDueAlarmToast(null)}
+            className="text-indigo-300 hover:text-white p-1"
+          >
+            <X size={16} />
+          </button>
+        </div>
+      )}
 
       {isSearchOpen && (
         <GlobalSearchModal
@@ -6981,236 +7155,280 @@ export default function App() {
           meetings={meetings}
           tasks={tasks}
           onClose={() => setIsSearchOpen(false)}
-          onSelectProject={handleOpenProject}
-          onNavigateTab={(tabId, filterNum) => handleNavigateWithFilter(tabId, filterNum || '')}
+          onSelectProject={handleOpenProjectFromSummary}
+          onNavigateTab={handleNavigateWithFilter}
         />
       )}
 
-      {lightboxState && (
-        <ScreenshotLightboxModal
-          images={lightboxState.images}
-          initialIndex={lightboxState.initialIndex}
-          onClose={() => setLightboxState(null)}
-          onSaveEditedImage={lightboxState.onSaveEdited}
-        />
-      )}
-
-      {toastMessage && (
-        <div className="fixed bottom-5 right-5 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-lg text-xs font-medium flex items-center gap-2 border border-slate-700">
-          <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
-          <span>{toastMessage}</span>
-        </div>
-      )}
-
-      <header className="bg-white border-b border-slate-200/80 sticky top-0 z-30 no-print shadow-2xs">
-        <div className="max-w-[1440px] mx-auto px-4 sm:px-6">
-          <div className="flex flex-wrap justify-between items-center py-3 gap-3">
-            <div className="flex items-center gap-3">
-              <div className="w-9 h-9 rounded-xl bg-indigo-600 text-white flex items-center justify-center font-bold text-base shadow-sm">
-                SUP
-              </div>
-              <div>
-                <h1 className="text-base font-bold text-slate-900 leading-tight">
-                  SUP Engineering — Трекер проектов
-                </h1>
-                <p className="text-[11px] text-slate-400">
-                  Водоснабжение, канализация и пожаротушение
-                </p>
-              </div>
+      <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-slate-200/80 shadow-2xs">
+        <div className="max-w-[1600px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-600 to-blue-500 flex items-center justify-center text-white font-bold shadow-sm">
+              SUP
             </div>
-
-            <div className="flex flex-wrap items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setIsSearchOpen(true)}
-                className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200/70 text-slate-600 px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-200/80 transition-colors"
-                title="Глобальный поиск по всем разделам (Ctrl+K)"
-              >
-                <Search size={14} className="text-indigo-600" />
-                <span className="hidden md:inline">Поиск...</span>
-                <kbd className="text-[10px] font-mono bg-white px-1.5 py-0.5 rounded border border-slate-200 text-slate-400">
-                  Ctrl+K
-                </kbd>
-              </button>
-
-              {/* Статус Google Drive */}
-              {!googleToken ? (
-                <button
-                  type="button"
-                  onClick={handleConnectGoogleDrive}
-                  className="flex items-center gap-1.5 bg-sky-50 hover:bg-sky-100 text-sky-700 border border-sky-200 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors"
-                  title="Подключить Google Drive для автоматического сохранения базы в облако"
-                >
-                  <Cloud size={14} /> Подключить Drive
-                </button>
-              ) : (
-                <div className="flex items-center gap-1.5 bg-emerald-50 border border-emerald-200 text-emerald-800 px-2.5 py-1.5 rounded-lg text-xs font-medium">
-                  {syncStatus === 'syncing' ? (
-                    <>
-                      <Loader2 size={13} className="animate-spin text-emerald-600" />
-                      <span>Сохранение...</span>
-                    </>
-                  ) : syncStatus === 'error' ? (
-                    <>
-                      <CloudOff size={13} className="text-rose-600" />
-                      <span className="text-rose-700">Ошибка Drive</span>
-                    </>
-                  ) : (
-                    <>
-                      <Cloud size={13} className="text-emerald-600" />
-                      <span>Drive{lastSyncTime ? `: ${lastSyncTime}` : ' ✓'}</span>
-                    </>
-                  )}
-                  {cloudFileId && (
-                    <button
-                      type="button"
-                      onClick={() => pushToGoogleDrive(googleToken, cloudFileId)}
-                      className="ml-1 p-0.5 text-emerald-600 hover:text-emerald-900 rounded"
-                      title="Синхронизировать с Google Drive сейчас"
-                    >
-                      <RefreshCw size={12} />
-                    </button>
-                  )}
-                  <button
-                    type="button"
-                    onClick={handleDisconnectGoogleDrive}
-                    className="ml-0.5 p-0.5 text-slate-400 hover:text-rose-600 rounded"
-                    title="Отключить Google Drive"
-                  >
-                    <LogOut size={12} />
-                  </button>
-                </div>
-              )}
-
-              <button
-                type="button"
-                onClick={requestDesktopNotifications}
-                className="p-1.5 rounded-lg text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 border border-slate-200/80 transition-colors"
-                title="Включить всплывающие уведомления о событиях календаря"
-              >
-                <Bell size={15} />
-              </button>
-
-              <span
-                className="hidden xl:inline-flex items-center gap-1 text-[11px] font-medium text-slate-500 bg-slate-100 border border-slate-200/80 px-2.5 py-1.5 rounded-lg"
-                title="Данные всегда дублируются локально в браузере (IndexedDB)"
-              >
-                <Database size={12} /> IndexedDB
-              </span>
-
-              <button
-                onClick={handleBackup}
-                className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200/70 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
-                title="Скачать полную базу данных с изображениями на компьютер"
-              >
-                <Save size={14} /> Бэкап
-              </button>
-              <label
-                className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200/70 text-slate-700 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-colors"
-                title="Восстановить базу из JSON-файла с компьютера"
-              >
-                <Upload size={14} /> Восстановить
-                <input type="file" accept=".json" onChange={handleRestore} className="hidden" />
-              </label>
+            <div>
+              <h1 className="font-bold text-slate-900 text-base leading-tight">Project Tracker</h1>
+              <div className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                <Database size={11} className="text-emerald-500" />
+                <span>Локально (IndexedDB)</span>
+              </div>
             </div>
           </div>
 
-          <nav className="flex gap-1 overflow-x-auto -mb-px">
-            {tabs.map((tab) => {
-              const Icon = tab.icon;
-              const isActive = activeTab === tab.id;
+          <nav className="hidden lg:flex items-center gap-1 bg-slate-100/80 p-1 rounded-xl border border-slate-200/60">
+            {tabs.map((t) => {
+              const Icon = t.icon;
+              const isActive = activeTab === t.id;
               return (
                 <button
-                  key={tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                  className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-all whitespace-nowrap ${
+                  key={t.id}
+                  onClick={() => setActiveTab(t.id)}
+                  className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-sm font-medium transition-all ${
                     isActive
-                      ? 'border-indigo-600 text-indigo-600'
-                      : 'border-transparent text-slate-500 hover:text-slate-800 hover:border-slate-300'
+                      ? 'bg-white text-indigo-600 shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-white/50'
                   }`}
                 >
                   <Icon size={16} />
-                  {tab.title}
-                  {tab.badge > 0 && (
+                  <span>{t.label}</span>
+                  {t.badge !== undefined && t.badge > 0 && (
                     <span
-                      className={`px-1.5 py-0.2 rounded-full text-[11px] font-bold ${
-                        tab.id === 2
-                          ? 'bg-rose-100 text-rose-700'
-                          : isActive
-                          ? 'bg-indigo-100 text-indigo-700'
-                          : 'bg-slate-200/80 text-slate-600'
+                      className={`text-[11px] px-1.5 py-0.2 rounded-full ${
+                        isActive ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-200 text-slate-600'
                       }`}
                     >
-                      {tab.badge}
+                      {t.badge}
                     </span>
                   )}
                 </button>
               );
             })}
           </nav>
+
+          <div className="flex items-center gap-1.5 sm:gap-2">
+            {/* Кнопка синхронизации с Google Drive */}
+            {!driveToken ? (
+              <button
+                type="button"
+                onClick={handleConnectGoogleDrive}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg transition-colors"
+                title="Подключить Google Drive для автоматической облачной синхронизации"
+              >
+                <CloudOff size={15} />
+                <span className="hidden sm:inline">Google Drive</span>
+              </button>
+            ) : (
+              <div className="flex items-center gap-1 bg-emerald-50/90 border border-emerald-200 px-2.5 py-1 rounded-lg text-xs">
+                <button
+                  type="button"
+                  onClick={() => pushToGoogleDrive(driveToken, false)}
+                  className="flex items-center gap-1.5 text-emerald-800 font-semibold hover:text-emerald-950"
+                  title={
+                    driveErrorMsg
+                      ? `Ошибка: ${driveErrorMsg}. Нажмите, чтобы повторить.`
+                      : `Синхронизировано с Google Drive${lastDriveSyncTime ? ` в ${lastDriveSyncTime}` : ''}. Нажмите для принудительного сохранения.`
+                  }
+                >
+                  {driveSyncStatus === 'syncing' ? (
+                    <Loader2 size={14} className="animate-spin text-indigo-600" />
+                  ) : driveSyncStatus === 'error' ? (
+                    <AlertCircle size={14} className="text-rose-600" />
+                  ) : (
+                    <Cloud size={14} className="text-emerald-600" />
+                  )}
+                  <span className="hidden md:inline">
+                    {driveSyncStatus === 'syncing'
+                      ? 'Сохранение...'
+                      : driveSyncStatus === 'error'
+                      ? 'Ошибка Drive'
+                      : `Drive${lastDriveSyncTime ? ` (${lastDriveSyncTime})` : ''}`}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => pullFromGoogleDrive(driveToken, false)}
+                  className="p-1 text-emerald-700 hover:bg-emerald-100 rounded"
+                  title="Загрузить актуальную базу из Google Drive"
+                >
+                  <RefreshCw size={12} />
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDisconnectGoogleDrive}
+                  className="p-1 text-slate-400 hover:text-rose-600 rounded"
+                  title="Отключить Google Drive"
+                >
+                  <LogOut size={12} />
+                </button>
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => setIsSearchOpen(true)}
+              className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-slate-600 bg-slate-100 hover:bg-slate-200/80 border border-slate-200/80 rounded-lg transition-colors"
+              title="Глобальный поиск по всем проектам (Ctrl + K)"
+            >
+              <Search size={14} className="text-indigo-600" />
+              <span className="hidden sm:inline">Поиск</span>
+              <kbd className="hidden md:inline-block text-[10px] px-1.5 py-0.2 bg-white border border-slate-200 rounded text-slate-400">
+                Ctrl+K
+              </kbd>
+            </button>
+
+            {notifPermission !== 'granted' && (
+              <button
+                type="button"
+                onClick={requestDesktopNotifications}
+                className="p-2 text-amber-600 hover:bg-amber-50 rounded-lg transition-colors"
+                title="Включить всплывающие уведомления браузера для напоминаний календаря"
+              >
+                <Bell size={18} />
+              </button>
+            )}
+
+            <button
+              onClick={handleBackupSave}
+              className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
+              title="Сохранить локальную резервную копию базы (.json)"
+            >
+              <Save size={18} />
+            </button>
+            <label
+              className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg cursor-pointer transition-colors"
+              title="Загрузить резервную копию (.json)"
+            >
+              <Upload size={18} />
+              <input type="file" accept=".json" onChange={handleBackupLoad} className="hidden" />
+            </label>
+            {activeTab !== 0 && (
+              <button
+                onClick={handleExportActiveTabCSV}
+                className="p-2 text-slate-500 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
+                title="Экспорт текущей вкладки в Excel (CSV)"
+              >
+                <Download size={18} />
+              </button>
+            )}
+            <button
+              onClick={() => window.print()}
+              className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors"
+              title="Печать / Сохранить в PDF"
+            >
+              <Printer size={18} />
+            </button>
+          </div>
+        </div>
+
+        <div className="flex lg:hidden border-t border-slate-100 px-3 py-1.5 gap-1 overflow-x-auto bg-slate-50/50">
+          {tabs.map((t) => {
+            const Icon = t.icon;
+            const isActive = activeTab === t.id;
+            return (
+              <button
+                key={t.id}
+                onClick={() => setActiveTab(t.id)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap ${
+                  isActive ? 'bg-indigo-600 text-white' : 'text-slate-600 bg-white border border-slate-200/70'
+                }`}
+              >
+                <Icon size={14} />
+                {t.label}
+              </button>
+            );
+          })}
         </div>
       </header>
 
-      <main className="max-w-[1440px] mx-auto px-4 sm:px-6 pt-6">
-        {activeTab === 0 && (
-          <TabOverviewCalendar
-            projects={projects}
-            setProjects={setProjects}
-            meetings={meetings}
-            tasks={tasks}
-            calendarEvents={calendarEvents}
-            setCalendarEvents={setCalendarEvents}
-            onOpenProject={handleOpenProject}
-            onNavigateWithFilter={handleNavigateWithFilter}
-          />
-        )}
-        {activeTab === 1 && (
-          <TabMeetings
-            meetings={meetings}
-            setMeetings={setMeetings}
-            projects={projects}
-            onPreviewImages={(images: string[], startIndex: number, onSaveEdited: (idx: number, newUrl: string) => void) =>
-              setLightboxState({ images, initialIndex: startIndex, onSaveEdited })
-            }
-            externalProjectFilter={crossTabProjectFilter}
-            onClearExternalFilter={() => setCrossTabProjectFilter('')}
-          />
-        )}
-        {activeTab === 2 && (
-          <TabProjectStatus
-            projects={projects}
-            setProjects={setProjects}
-            activeProjectId={activeProjectId}
-            setActiveProjectId={setActiveProjectId}
-            meetings={meetings}
-            setMeetings={setMeetings}
-            tasks={tasks}
-            setTasks={setTasks}
-            onNavigateWithFilter={handleNavigateWithFilter}
-            onPreviewImages={(images: string[], startIndex: number, onSaveEdited: (idx: number, newUrl: string) => void) =>
-              setLightboxState({ images, initialIndex: startIndex, onSaveEdited })
-            }
-            onSyncSingleProjectToReport={handleSyncSingleProjectToReport}
-            externalSubTab={crossProjectSubTab}
-            onClearExternalSubTab={() => setCrossProjectSubTab(null)}
-          />
-        )}
-        {activeTab === 3 && (
-          <TabWeeklyReport
-            reports={reports}
-            setReports={setReports}
-            projects={projects}
-          />
-        )}
-        {activeTab === 4 && (
-          <TabTasks
-            tasks={tasks}
-            setTasks={setTasks}
-            externalProjectFilter={crossTabProjectFilter}
-            onClearExternalFilter={() => setCrossTabProjectFilter('')}
-          />
+      <main className="flex-grow max-w-[1600px] w-full mx-auto px-4 sm:px-6 py-6">
+        {!allLoaded ? (
+          <div className="py-20 text-center text-sm text-slate-400">
+            Загрузка локальной базы данных...
+          </div>
+        ) : (
+          <>
+            {activeTab === 0 && (
+              <TabOverviewCalendar
+                projects={projects}
+                setProjects={setProjects}
+                meetings={meetings}
+                setMeetings={setMeetings}
+                tasks={tasks}
+                calendarEvents={calendarEvents}
+                setCalendarEvents={setCalendarEvents}
+                onOpenProject={handleOpenProjectFromSummary}
+                onNavigateWithFilter={handleNavigateWithFilter}
+              />
+            )}
+            {activeTab === 1 && (
+              <TabMeetings
+                meetings={meetings}
+                setMeetings={setMeetings}
+                projects={projects}
+                onPreviewImages={(images: string[], index: number, onSaveEdited: any) =>
+                  setLightboxState({ images, index, onSaveEdited })
+                }
+                externalProjectFilter={externalProjectFilter}
+                onClearExternalFilter={() => setExternalProjectFilter('')}
+              />
+            )}
+            {activeTab === 2 && (
+              <TabProjectStatus
+                projects={projects}
+                setProjects={setProjects}
+                activeProjectId={activeProjectId}
+                setActiveProjectId={setActiveProjectId}
+                meetings={meetings}
+                setMeetings={setMeetings}
+                tasks={tasks}
+                setTasks={setTasks}
+                onNavigateWithFilter={handleNavigateWithFilter}
+                onPreviewImages={(images: string[], index: number, onSaveEdited: any) =>
+                  setLightboxState({ images, index, onSaveEdited })
+                }
+                onSyncSingleProjectToReport={handleSyncSingleProjectToReport}
+                externalSubTab={externalProjectSubTab}
+                onClearExternalSubTab={() => setExternalProjectSubTab(null)}
+              />
+            )}
+            {activeTab === 3 && (
+              <TabReport
+                reportRows={reportRows}
+                setReportRows={setReportRows}
+                projects={projects}
+              />
+            )}
+            {activeTab === 4 && (
+              <TabTasks
+                tasks={tasks}
+                setTasks={setTasks}
+                externalProjectFilter={externalProjectFilter}
+                onClearExternalFilter={() => setExternalProjectFilter('')}
+              />
+            )}
+          </>
         )}
       </main>
+
+      {lightboxState && (
+        <ScreenshotLightboxModal
+          images={lightboxState.images}
+          initialIndex={lightboxState.index}
+          onClose={() => setLightboxState(null)}
+          onSaveEditedImage={(idx, newUrl) => {
+            if (lightboxState.onSaveEdited) {
+              lightboxState.onSaveEdited(idx, newUrl);
+            }
+            setLightboxState((prev) => {
+              if (!prev) return null;
+              const nextImgs = [...prev.images];
+              nextImgs[idx] = newUrl;
+              return { ...prev, images: nextImgs };
+            });
+            showToast('Пометки на скриншоте сохранены ✓');
+          }}
+        />
+      )}
     </div>
   );
 }
